@@ -945,7 +945,8 @@ int lua_Get(lua_State* L) {
         lua_settable(L, -3);
     }
     lua_settop(L, 3);
-    return 0;
+    lua_pushinteger(L, r);
+    return 1;
 }
 
 /* 
@@ -996,7 +997,8 @@ int lua_Post(lua_State* L) {
         lua_settable(L, -3);
     }
     lua_settop(L, 3);
-    return 0;
+    lua_pushinteger(L, r);
+    return 1;
 }
 
 /* 
@@ -1043,7 +1045,8 @@ int lua_Head(lua_State* L) {
         lua_settable(L, -3);
     }
     lua_settop(L, 3);
-    return 0;
+    lua_pushinteger(L, r);
+    return 1;
 }
 
 /* 
