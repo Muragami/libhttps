@@ -4,8 +4,8 @@ OBJS = ./obj/
 SRCS = ./src/
 
 WLIBS = -lwinhttp ./lib/lua51.dll
-MLIBS = -lpthread -lcurl ./lib/lua51.dll
-LLIBS = -lpthread -lcurl ./lib/lua51.dll
+MLIBS = -framework Foundation ./lib/libluajit.dylib
+LLIBS = -lpthread -lcurl ./lib/lua51.so
 
 windows: $(OBJS)libhttps.dll
 
