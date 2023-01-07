@@ -80,6 +80,7 @@ httpsReq* _newHttpsReq()
     pthread_mutex_init((pthread_mutex_t*)req->mutex, NULL);
     req->read = calloc(1, sizeof(readBuffer));
     req->read->data = calloc(1, _bufferSize);
+    req->readBufferSize = _bufferSize;
     req->last = req->read;
     req->headerDone = req->complete = req->finished = false;
     req->startTime = _getSeconds();
@@ -103,6 +104,8 @@ void _delHttpsReq(httpsReq *p)
         b = b->nextBuffer;
         free(o);
     }
+    // free the mutex
+    pthread_mutex_destroy((pthread_mutex_t*)p->mutex);
     // free the request itself
     naettClose((naettRes*)p->res);
     naettFree((naettReq*)p->request);
@@ -181,23 +184,25 @@ void httpsUpdate()
             if (r->complete && r->finished) {
                 // delete it
                 _delHttpsReq(r);
+            } else {
+                // update status on the response
+                int rc, comp;
+                rc = naettGetStatus(r->res);
+                if (rc != r->returnCode) {
+                    r->returnCode = rc;
+                }
+                if (r->headerDone) {
+                    // might be valid, probe headers for content type and length
+                    char *hval = (char*)naettGetHeader((naettRes*)r->res, "Content-Length");
+                    if (hval != NULL) r->contentTotalBytes = atoi(hval);
+                    r->contentMimeType = (char*)naettGetHeader((naettRes*)r->res, "Content-Type");
+                }
+                comp = naettComplete((naettRes*)r->res);
+                if (comp != r->complete) {
+                    r->complete = comp;    
+                }    
             }
-            // update status on the response
-            int rc, comp;
-            rc = naettGetStatus(r->res);
-            if (rc != r->returnCode) {
-                r->returnCode = rc;
-            }
-            if (r->headerDone) {
-                // might be valid, probe headers for content type and length
-                char *hval = (char*)naettGetHeader((naettRes*)r->res, "Content-Length");
-                if (hval != NULL) r->contentTotalBytes = atoi(hval);
-                r->contentMimeType = (char*)naettGetHeader((naettRes*)r->res, "Content-Type");
-            }
-            comp = naettComplete((naettRes*)r->res);
-            if (comp != r->complete) {
-                r->complete = comp;    
-            }
+            
         }
     }
     pthread_mutex_unlock(&_mainLock);
@@ -342,8 +347,7 @@ const char* httpsGetHeader(void *p, const char *w)
 int _HeaderLister(const char* name, const char* value, void* userData)
 {
     httpsReq* r = (httpsReq*)userData;
-    r->lister(name, value, userData);
-    return 0;
+    return r->lister(name, value, userData);
 }
 
 void httpsListHeaders(void *p, httpsHeaderLister lister)
@@ -369,7 +373,7 @@ void httpsFinished(void *p)
 {
     httpsReq *r = (httpsReq*)p;
     pthread_mutex_lock((pthread_mutex_t*)r->mutex);
-    if (r->complete) r->finished = true;
+    r->finished = true;
     pthread_mutex_unlock((pthread_mutex_t*)r->mutex);
 }
 
@@ -551,9 +555,9 @@ void _easyReadResponse(int i, char* data, int *bytes, bool *complete)
     }
     if (d->read == NULL) d->read = r->read;
     *bytes = d->read->end;
-    memcpy(data,d->read->data,d->read->end);
+    memcpy(data, d->read->data, d->read->end);
     d->read = d->read->nextBuffer;
-    if (d->read == NULL) *complete = true; else *complete = false;
+    *complete = (d->read == NULL);
     pthread_mutex_unlock((pthread_mutex_t*)r->mutex);    
 }
 
@@ -561,6 +565,11 @@ void easySetup(easyCallback cb, unsigned int bsize)
 {
     httpsInit(NULL, bsize);
     _theEasyCallback = cb;
+}
+
+void easyListHeaders(int h, httpsHeaderLister lister)
+{
+    httpsListHeaders(_requestTable[h], lister);
 }
 
 void easyOptionUI(unsigned int opt, unsigned int val) {
@@ -770,10 +779,10 @@ int easyHead(const char *URL, const char* *_headers, int header_count, bool head
     return r->index;
 }
 
-// a lua module wrapper for the easy calls above
-#ifndef NOT_LUA_DLL
-
-#include "src/lauxlib.h"
+void easyShutdown()
+{
+    httpsCleanup();
+}
 
 lua_State* lState = NULL;
 int _luaIdLocation = 51;
@@ -820,14 +829,16 @@ int lua_ReadResponse(lua_State* L)
         return 1;
     } else if (lua_istable(L, 1)) {
         // return a string for this buffer chunk of the response
-        char *buffer = calloc(1,lua_tointeger(L, lua_upvalueindex(3)));
-        int bytes;
+        char *buffer = calloc(1, lua_tointeger(L, lua_upvalueindex(3)) + 16);
+        int bytes = 0;
         bool done;
         ReadResponse(lua_tointeger(L, lua_upvalueindex(1)), buffer, &bytes, &done);
+        printf("%llu, %d, %d\n", (unsigned long long)buffer, bytes, done);
         lua_pushinteger(L, lua_objlen(L, 1) + 1);
-        lua_pushlstring(L, buffer, bytes);
-        lua_rawset(L, -3);
-        return 0;
+        lua_pushlstring(L, buffer, bytes + 1);
+        lua_rawset(L, 1);
+        lua_pushboolean(L, !done);
+        return 1;
     } else luaL_error(L, "https callback ReadResponse() function must be called with a table to populate!");
     return 0;
 }
@@ -1049,8 +1060,18 @@ int lua_Init(lua_State* L) {
     } else easySetup(lua_Callback, 0);
     lua_getregtable(L);
     lua_pushinteger(L, 2422422);
-    lua_rawseti(L, -1, 1421421);
+    lua_rawseti(L, -2, 1421421);
     lua_pop(L, 1);
+    return 0;
+}
+
+/* 
+    https.shutdown()
+
+    close and clean up the system
+*/
+int lua_Shutdown(lua_State *L) {
+    easyShutdown();
     return 0;
 }
 
@@ -1063,7 +1084,7 @@ int lua_Init(lua_State* L) {
 */
 int lua_Response(lua_State *L) {
     int i = luaL_checkinteger(L, 1);
-    if ((i < 0) || (i > MAX_REQUEST)) luaL_error(L, "https.response() attempt to index a request %d, outside range 0 - %d", i, MAX_REQUEST);
+    if ((i < 0) || (i >= MAX_REQUEST)) luaL_error(L, "https.response() attempt to index a request %d, outside range 0 - %d", i, MAX_REQUEST);
     lua_pushinteger(L, httpsGetCodeI(i));
     return 1;
 }
@@ -1135,10 +1156,51 @@ int lua_Metrics(lua_State* L) {
     return 1;
 }
 
+int lua_HeaderLister(const char* name, const char* value, void* r)
+{
+    lua_State* L = lState;
+    lua_pushstring(L, name);
+    lua_pushstring(L, value);
+    lua_settable(L, -3);
+    return 1;
+}
+
+/* 
+    https.list(handle)
+
+    handle integer of the request
+
+    returns a table of read headers for the request
+*/
+int lua_List(lua_State* L) {
+    int h = luaL_checkinteger(L, 1);
+    if ((h < 0) || (h >= MAX_REQUEST)) luaL_error(L, "https.list() called with out of range value %d", h);
+    lua_newtable(L);
+    httpsListHeaders(_requestTable[h], lua_HeaderLister);
+    return 1;
+}
+
+/* 
+    https.release(handle)
+
+    handle integer of the request
+
+    mark the request as finished so it can be returned to the available pool
+*/
+int lua_Release(lua_State* L) {
+    int h = luaL_checkinteger(L, 1);
+    if ((h < 0) || (h >= MAX_REQUEST)) luaL_error(L, "https.release() called with out of range value %d", h);
+    httpsFinished(_requestTable[h]);
+    return 0;
+}
+
 luaL_Reg lfunc[] = {
     { "init", lua_Init },
+    { "shutdown", lua_Init },
     { "options", lua_Options },
     { "metrics", lua_Metrics },
+    { "release", lua_Release },
+    { "list", lua_List },
     { "response", lua_Response },
     { "update", lua_Update },
     { "get", lua_Get  },
@@ -1147,7 +1209,7 @@ luaL_Reg lfunc[] = {
     { NULL, NULL },
 };
 
-int luaopen_libhttps (lua_State* L) {
+int luaopen_libhttps(lua_State* L) {
     lState = L;
     lua_pushlightuserdata(L, &_luaIdLocation);
     lua_newtable (L);
@@ -1156,4 +1218,3 @@ int luaopen_libhttps (lua_State* L) {
     return 1;
 }
 
-#endif

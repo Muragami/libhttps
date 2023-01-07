@@ -4,6 +4,7 @@
 */
 
 #include "src/naett.h"
+#include "src/lauxlib.h"
 #include <stdbool.h>
 
 #ifdef __cplusplus
@@ -48,6 +49,7 @@ typedef void (*easyCallback)(int handle, const char* url, const char* msg, int c
 
 // the high level interface if you hail from Letterkenney
 void easySetup(easyCallback cb, unsigned int bsize);
+void easyListHeaders(int h, httpsHeaderLister lister);
 void easyOptionUI(unsigned int opt, unsigned int val);
 void easyOptionD(unsigned int opt, double val);
 int easyHasMetrics(int i);
@@ -59,6 +61,7 @@ int easyGet(const char *URL, const char* *headers, int header_count, bool header
 int easyPost(const char *URL, const char *body, unsigned int bodyBytes, const char* *headers, int header_count, bool header_compact);
 int easyHead(const char *URL, const char* *headers, int header_count, bool header_compact);
 
+int luaopen_libhttps(lua_State* L);
 
 #ifdef __cplusplus
 }
