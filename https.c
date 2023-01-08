@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <sys/time.h>
 
+
+
 // maximum simultaneous requests allowed
 #define MAX_REQUEST 128
 // maximum headers allowed in a request
@@ -93,7 +95,6 @@ httpsReq* _newHttpsReq()
 
 void _delHttpsReq(httpsReq *p)
 {
-    pthread_mutex_lock(&_mainLock);
     _requestTable[p->index] = NULL;
     // free read buffers
     readBuffer *b = p->read;
@@ -109,8 +110,8 @@ void _delHttpsReq(httpsReq *p)
     // free the request itself
     naettClose((naettRes*)p->res);
     naettFree((naettReq*)p->request);
+
     free(p);
-    pthread_mutex_unlock(&_mainLock);
 }
 
 int _bodyWriter(const void* source, int bytes, void* userData)
@@ -143,6 +144,7 @@ int _bodyWriter(const void* source, int bytes, void* userData)
 
 void httpsInit(httpsInitData init, unsigned int readBufferSize)
 {
+    setvbuf (stdout, (char*)NULL, _IONBF, BUFSIZ);
     naettInit((naettInitData)init);
     _bufferSize = readBufferSize;
     if (_bufferSize == 0) _bufferSize = 16384;
@@ -833,7 +835,6 @@ int lua_ReadResponse(lua_State* L)
         int bytes = 0;
         bool done;
         ReadResponse(lua_tointeger(L, lua_upvalueindex(1)), buffer, &bytes, &done);
-        printf("%llu, %d, %d\n", (unsigned long long)buffer, bytes, done);
         lua_pushinteger(L, lua_objlen(L, 1) + 1);
         lua_pushlstring(L, buffer, bytes + 1);
         lua_rawset(L, 1);
@@ -916,7 +917,7 @@ int lua_Get(lua_State* L) {
     const char *head[MAX_HEADERS*2];
     int i = 0;
     int r = 0;
-    const char *url = luaL_checklstring (L, 1, NULL);
+    const char *url = luaL_checklstring(L, 1, NULL);
     luaL_checktype(L, 2, LUA_TTABLE);
     if (lua_istable(L, 3)) {
         // scan the table for string pairs, ignoring everything else
