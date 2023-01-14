@@ -5,7 +5,7 @@ OBJS = ./obj/
 SRCS = ./src/
 
 WLIBS = -lwinhttp ./lib/lua51.dll ./lib/libpcre2-8.mingw64.a
-MLIBS = -framework Foundation ./lib/libluajit.dylib
+MLIBS = -framework Foundation ./lib/libluajit.dylib -lpcre2-8
 LLIBS = -lpthread -lcurl -lluajit-5.1 -lpcre2-8
 
 windows: $(OBJS)libhttps.dll

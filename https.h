@@ -70,6 +70,7 @@ int httpsGetCodeI(int i);
 const char* httpsGetHeader(void *p, const char *w);
 unsigned int httpsGetBodyLength(void *p);
 void httpsGetBody(void *p, unsigned int maxBytes);
+void httpsGetBodyBuffer(void *p, memBuffer *b);
 void httpsListHeaders(void *p, httpsHeaderLister lister);
 bool httpsIsComplete(void* p);
 void httpsFinished(void* p);
@@ -79,11 +80,27 @@ void httpsSetHeader(void *p, const char *name, const char *val);
 void httpsDelHeaders(void *p);
 void httpsRelease(void *p);
 
+//
+// the high level interface if you hail from Letterkenney
+//
+
 // high-level callbacks
 typedef void (*easyCallback)(int handle, const char* url, const char* msg, int code, unsigned int sz, void* data);
 
-// the high level interface if you hail from Letterkenney
+// a message block for threaded messages in the easy system
+typedef struct _easyMessage {
+    unsigned short version;     // must be 0x100 to 0x01FF (00-FF for revisions to type 1 message)
+    unsigned short slot;        // slot of the message if it is a command
+    int handle;
+    const char* url;
+    char message[256];
+    int code;
+    unsigned int sz;
+    void *data;
+} easyMessage;
+
 void easySetup(easyCallback cb, unsigned int bsize);
+void easySetupThreaded(unsigned int msgQueDepth, unsigned int slotCount);
 void easyListHeaders(int h, httpsHeaderLister lister);
 void easyOptionUI(unsigned int opt, unsigned int val);
 void easyOptionD(unsigned int opt, double val);

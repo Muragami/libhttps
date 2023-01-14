@@ -27,6 +27,8 @@
 #define _ENTER_     pthread_mutex_lock(&con.mainLock);
 #define __EXIT_     pthread_mutex_unlock(&con.mainLock);
 #define _EXIT_RET(x)    { pthread_mutex_unlock(&con.mainLock); return x; }
+#define _ENTER_REQ(x)   pthread_mutex_lock(&x->mutex);
+#define _EXIT_REQ(x)    pthread_mutex_unlock(&x->mutex);
 
 httpsMemoryInterface mem = { malloc, calloc, realloc, free };
 
@@ -248,8 +250,7 @@ void httpsEnsurePersistentBuffers(int x) {
 
     returns the handle id of the persistent buffer to pass to a request later
 */
-int httpsAddPersistentBuffer(char *bmem, unsigned int bytes)
-{
+int httpsAddPersistentBuffer(char *bmem, unsigned int bytes) {
     int i;
     _ENTER_
     for (i = 0; i < con.persistentBufferCount; i++) {
@@ -283,8 +284,7 @@ int httpsAddPersistentBuffer(char *bmem, unsigned int bytes)
 /*
     Remove (free for use later) persistent buffer handle id
 */
-void httpsRemovePersistentBuffer(int id)
-{
+void httpsRemovePersistentBuffer(int id) {
     if ((id < 0) || (id >= con.persistentBufferCount)) return;
     _ENTER_
     if (con.persistentBuffer[id].index & HTTPS_MEMBUFFER_FOREIGN)
@@ -304,8 +304,7 @@ void httpsRemovePersistentBuffer(int id)
     __EXIT_
 }
 
-void httpsInit(httpsInitData init, unsigned int readBufferSize)
-{
+void httpsInit(httpsInitData init, unsigned int readBufferSize) {
     // for some console debugging REMOVE
     // setvbuf (stdout, (char*)NULL, _IONBF, BUFSIZ);
     // set all memory in our context to zero
@@ -317,8 +316,7 @@ void httpsInit(httpsInitData init, unsigned int readBufferSize)
     pthread_mutex_init(&con.mainLock, NULL);
 }
 
-void httpsCleanup()
-{
+void httpsCleanup() {
     _ENTER_
     for (int i = 0; i < MAX_REQUEST; i++)
     {
@@ -338,8 +336,7 @@ void httpsCleanup()
     __EXIT_
 }
 
-void httpsUpdate()
-{
+void httpsUpdate() {
     if (con.bufferSize == 0) return;
     _ENTER_
     for (int i = 0; i < MAX_REQUEST; i++)
@@ -375,8 +372,7 @@ void httpsUpdate()
     __EXIT_
 }
 
-unsigned int httpsRequestCount()
-{
+unsigned int httpsRequestCount() {
     unsigned int ret = 0;
     _ENTER_
     for (int i = 0; i < MAX_REQUEST; i++)
@@ -385,8 +381,7 @@ unsigned int httpsRequestCount()
     return ret;
 }
 
-void* _makeRequest(httpsReq* r, const char *method, void* _headers, unsigned int bodyBytes, const char* body)
-{
+void* _makeRequest(httpsReq* r, const char *method, void* _headers, unsigned int bodyBytes, const char* body) {
     if (_headers == NULL) {
         return (void*)naettRequest(r->URL, naettMethod(method), naettHeader("accept", "*/*"), naettBodyWriter(_bodyWriter, r));
     } else {
@@ -410,8 +405,7 @@ void* _makeRequest(httpsReq* r, const char *method, void* _headers, unsigned int
     }
 }
 
-void* httpsGet(const char *URL, int flags,  void *headers)
-{
+void* httpsGet(const char *URL, int flags,  void *headers) {
     httpsReq* r;
     if ((con.bufferSize == 0) || (URL == NULL) || (strlen(URL) == 0)) return NULL;
     r = _newHttpsReq(flags);
@@ -423,8 +417,7 @@ void* httpsGet(const char *URL, int flags,  void *headers)
     return (void*)r;
 }
 
-void* httpsPost(const char *URL, int flags,  const char *body, unsigned int bodyBytes, void *headers)
-{
+void* httpsPost(const char *URL, int flags,  const char *body, unsigned int bodyBytes, void *headers) {
     httpsReq* r;
     if ((con.bufferSize == 0) || (URL == NULL) || (strlen(URL) == 0)) return NULL;
     r = _newHttpsReq(flags);
@@ -446,8 +439,7 @@ void* httpsPost(const char *URL, int flags,  const char *body, unsigned int body
     return (void*)r;
 }
 
-void* httpsPostLinked(const char *URL, int flags,  const char *body, unsigned int bodyBytes, void *headers)
-{
+void* httpsPostLinked(const char *URL, int flags,  const char *body, unsigned int bodyBytes, void *headers) {
     httpsReq* r;
     if ((con.bufferSize == 0) || (URL == NULL) || (strlen(URL) == 0)) return NULL;
     r = _newHttpsReq(flags);
@@ -468,8 +460,7 @@ void* httpsPostLinked(const char *URL, int flags,  const char *body, unsigned in
     return (void*)r;
 }
 
-void* httpsHead(const char *URL, int flags,  void *headers)
-{
+void* httpsHead(const char *URL, int flags,  void *headers) {
     httpsReq* r;
     if ((con.bufferSize == 0) || (URL == NULL) || (strlen(URL) == 0)) return NULL;
     r = _newHttpsReq(flags);
@@ -481,79 +472,70 @@ void* httpsHead(const char *URL, int flags,  void *headers)
     return (void*)r;    
 }
 
-int httpsGetCode(void *p)
-{
+int httpsGetCode(void *p) {
     httpsReq *r = (httpsReq*)p;
     int ret;
-    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
+    _ENTER_REQ(r)
     ret = naettGetStatus((naettRes*)r);
-    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
+    _EXIT_REQ(r)
     return ret;
 }
 
-int httpsGetCodeI(int i)
-{
+int httpsGetCodeI(int i) {
     int ret;
     _ENTER_
     httpsReq *r = con.requestTable[i];
     __EXIT_
-    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
+    _ENTER_REQ(r)
     ret = naettGetStatus((naettRes*)r);
-    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
+    _EXIT_REQ(r)
     return ret;
 }
 
-const char* httpsGetHeader(void *p, const char *w)
-{
+const char* httpsGetHeader(void *p, const char *w) {
     httpsReq *r = (httpsReq*)p;
     const char *ret;
-    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
+    _ENTER_REQ(r)
     ret = naettGetHeader((naettRes*)r->res, w);
-    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
+    _EXIT_REQ(r)
     return ret;
 }
 
-int _HeaderLister(const char* name, const char* value, void* userData)
-{
+int _HeaderLister(const char* name, const char* value, void* userData) {
     httpsReq* r = (httpsReq*)userData;
     return r->lister(name, value, userData);
 }
 
-void httpsListHeaders(void *p, httpsHeaderLister lister)
-{
+void httpsListHeaders(void *p, httpsHeaderLister lister) {
     httpsReq *r = (httpsReq*)p;
-    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
+    _ENTER_REQ(r)
     r->lister = lister;
     naettListHeaders((naettRes*)r->res, _HeaderLister, (void*)r);
-    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
+    _EXIT_REQ(r)
 }
 
-bool httpsIsComplete(void *p)
-{
+bool httpsIsComplete(void *p) {
     httpsReq *r = (httpsReq*)p;
     bool ret = false;
-    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
+    _ENTER_REQ(r)
     ret = r->complete;
-    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
+    _EXIT_REQ(r)
     return ret;
 }
 
-void httpsFinished(void *p)
-{
+void httpsFinished(void *p) {
     httpsReq *r = (httpsReq*)p;
-    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
+    _ENTER_REQ(r)
     r->finished = true;
-    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
+    _EXIT_REQ(r)
 }
 
-void* httpsNewHeaders()
-{
+void* httpsNewHeaders() {
     headers *h = calloc(1,sizeof(headers));
     return (void*)h;
 }
 
-void httpsSetHeader(void *p, const char *name, const char *val)
-{
+void httpsSetHeader(void *p, const char *name, const char *val) {
     headers *h = (headers*)p;
     int i;
     for (i = 0; i < MAX_HEADERS; i++) {
@@ -569,40 +551,43 @@ void httpsSetHeader(void *p, const char *name, const char *val)
     }
 }
 
-void httpsDelHeaders(void *p)
-{
+void httpsDelHeaders(void *p) {
     headers *h = (headers*)p;
     for (int i = 0; i < h->last*2; i++)
         mem.free(h->str[i]);
     mem.free((headers*)h);
 }
 
-unsigned int httpsGetBodyLength(void *p)
-{
+unsigned int httpsGetBodyLength(void *p) {
     httpsReq *r = (httpsReq*)p;
     unsigned int ret;
-    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
+    _ENTER_REQ(r)
     ret = r->readTotalBytes;
-    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
+    _EXIT_REQ(r)
     return ret;
 }
 
-void httpsGetBody(void *p, unsigned int maxBytes)
-{
+void httpsGetBody(void *p, unsigned int maxBytes) {
     unsigned int len = maxBytes;
     httpsReq *r = (httpsReq*)p;
-    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
+    _ENTER_REQ(r)
     if (len > r->buffer.end) len = r->buffer.end;
     memcpy(p, r->buffer.data, len);
-    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
+    _EXIT_REQ(r)
 }
 
-void httpsRelease(void *p)
-{
+void httpsGetBodyBuffer(void *p, memBuffer *b) {
     httpsReq *r = (httpsReq*)p;
-    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
+    _ENTER_REQ(r)
+    memcpy(b, &r->buffer, sizeof(memBuffer));
+    _EXIT_REQ(r)
+}
+
+void httpsRelease(void *p) {
+    httpsReq *r = (httpsReq*)p;
+    _ENTER_REQ(r)
     r->finished = true;
-    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
+    _EXIT_REQ(r)
 }
 
 #ifdef _WIN32
@@ -655,13 +640,14 @@ const char* _easyGetHeader(int i, const char *header)
 {
     httpsReq* r = con.requestTable[i];
     const char *ret;
-    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
+    _ENTER_REQ(r)
     ret = naettGetHeader((naettRes*)r->res, header);
-    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
+    _EXIT_REQ(r)
     return ret;
 }
 
 easyCallback _theEasyCallback = NULL;
+
 typedef struct _easyData {
     bool complete;
     bool headerDone;
@@ -682,6 +668,19 @@ typedef struct _easyMetric {
     double estimatedRemainingTime;
 } easyMetric;
 
+typedef struct _easyThreadStack {
+    int version;
+    int msgLimit;
+    int msgCount;
+    int slotLimit;
+    int slotCount;
+    easyMessage *msg;
+    easyMessage *slot;
+    pthread_mutex_t msgLock;
+    pthread_mutex_t slotLock;
+} easyThreadStack;
+
+easyThreadStack *_threadStack = NULL;
 easyMetric _metricTable[MAX_REQUEST];
 unsigned int _easyOptions = 0;
 double _easyDelay = 0.0;
@@ -702,10 +701,35 @@ double _easyDelay = 0.0;
 #define EASY_METRIC_REMAINING   7
 #define EASY_METRIC_RUNTIME     8
 
+void _easyThreadedCallback(int handle, const char* url, const char* msg, int code, unsigned int sz, void* data) {
+    // TODO
+}
+
 void easySetup(easyCallback cb, unsigned int bsize)
 {
     httpsInit(NULL, bsize);
     _theEasyCallback = cb;
+}
+
+void easySetupThreaded(unsigned int msgQueDepth, unsigned int slotCount)
+{
+    if (msgQueDepth == 0) msgQueDepth = 200;
+    if (slotCount == 0) slotCount = 50;
+
+    httpsInit(NULL, 0);
+    _theEasyCallback = _easyThreadedCallback;
+
+    _threadStack = mem.calloc(1, sizeof(easyThreadStack));
+    easyThreadStack *ps = _threadStack;
+    ps->msgLimit = msgQueDepth;
+    ps->slotLimit = slotCount;
+    ps->msg = mem.calloc(1, sizeof(easyMessage) * ps->msgLimit);
+    if (ps->msg == NULL) return;
+    ps->slot = mem.calloc(1, sizeof(easyMessage) * ps->slotLimit);
+    if (ps->slot == NULL) return;
+    pthread_mutex_init(&ps->msgLock, NULL);
+    pthread_mutex_init(&ps->slotLock, NULL);
+    ps->version = 0x0100;
 }
 
 void easyListHeaders(int h, httpsHeaderLister lister)
@@ -794,6 +818,9 @@ void easyUpdate()
 {
     int mcnt = 0;
     double secs;
+    // are we threaded? if so, why are we calling this? bug out
+    if ((_threadStack != NULL) && (_threadStack->version == 0x0100)) return;
+    // or... proceed and handle the update
     httpsUpdate();
     pthread_mutex_lock(&con.mainLock);
     for (int i = 0; i < MAX_REQUEST; i++)
@@ -875,6 +902,14 @@ int easyGet(const char *URL, int flags, const char* *_headers, int header_count,
 {
     headers *h;
     httpsReq *r;
+
+    // are we threaded? if so, we just populate a message slot and leave
+    if ((_threadStack != NULL) && (_threadStack->version == 0x0100)) {
+        int slot = -1;
+        // TODO
+        return slot;
+    }
+
     if ((header_count > 0) && (_headers != NULL))
     {
         h = _easyCreateHeaders(_headers, header_count, header_compact);
