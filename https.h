@@ -18,18 +18,49 @@ typedef JavaVM* httpsInitData;
 typedef void* httpsInitData;
 #endif
 
+typedef struct _httpsMemoryInterface {
+    void* (*malloc)(size_t bytes);
+    void* (*calloc)(size_t sz, size_t count);
+    void* (*realloc)(void *p, size_t bytes);
+    void  (*free)(void *p);
+} httpsMemoryInterface;
+
+typedef struct _memBuffer {
+    unsigned int end;
+    unsigned long length;
+    unsigned char *data;
+} memBuffer;
+
 // void* is the httpsReq* that called for this listing, you can get and set *userData in there
 typedef int (*httpsHeaderLister)(const char* name, const char* value, void* r);
+
+// a flush routine to call when a read buffer is full
+typedef void (*httpsFlush)(int index, const char* URL, void *user, memBuffer *p);
+
+#define HTTPS_FIXED_BUFFER          0x10000000      // a fixed buffer for this request
+#define HTTPS_PERSISTENT_BUFFER     0x20000000      // use an established already existing buffer
+#define HTTPS_REUSE_BUFFER          0x40000000      // reuse a buffer, using a flush callback each time it's full
+#define HTTPS_DOUBLE_UNTIL          0x80000000      // double realloc() until we hit a set size and them just allocated that size over and over (2x, 3x, etc.)
+#define HTTPS_DOUBLE_FOREVER(x)     ((x & 0xF0000000) == 0)      
+                                                    // just double each time we realloc()
+#define HTTPS_BUFFER_KB(x)          (x & 0xFFFFFFF) // ~ 255GB is the largest fixed buffer we can support, allocated as 1 kb units
+#define HTTPS_PERSIST_ID(x)         (x & 0xFFFF)    // 65536 possible persistant buffers
+#define HTTPS_OPEN_BUFFER           0xFFFFFFFF      // a buffer end point that is invalid
 
 // the low level interface if you want to be fancy
 void httpsInit(httpsInitData init, unsigned int readBufferSize);
 void httpsCleanup();
+void httpsUseMemoryInterface(httpsMemoryInterface *p);
+void httpsSetFlushRoutine(httpsFlush f);
+void httpsEnsurePersistentBuffers(int i);
+int httpsAddPersistentBuffer(char *bmem, unsigned int bytes);
+void httpsRemovePersistentBuffer(int id);
 void httpsUpdate();
-void* httpsGet(const char *URL, void *headers);
-void* httpsPost(const char *URL, const char *body, unsigned int bodyBytes, void *headers);
+void* httpsGet(const char *URL, int flags, void *headers);
+void* httpsPost(const char *URL, int flags, const char *body, unsigned int bodyBytes, void *headers);
 // in the linked case, we don't copy body at all and expect you to only free it when we are done!
-void* httpsPostLinked(const char *URL, const char *body, unsigned int bodyBytes, void *headers);
-void* httpsHead(const char *URL, void *headers);
+void* httpsPostLinked(const char *URL, int flags, const char *body, unsigned int bodyBytes, void *headers);
+void* httpsHead(const char *URL, int flags, void *headers);
 int httpsGetCode(void *p);
 int httpsGetCodeI(int i);
 const char* httpsGetHeader(void *p, const char *w);
@@ -57,9 +88,9 @@ double easyGetMetricD(int i, int w);
 int easyGetMetricI(int i, int w);
 const char *easyGetMetricS(int i, int w);
 void easyUpdate();	// if you call this is counts as calling the low-level httpsUpdate() above, FYI
-int easyGet(const char *URL, const char* *headers, int header_count, bool header_compact);
-int easyPost(const char *URL, const char *body, unsigned int bodyBytes, const char* *headers, int header_count, bool header_compact);
-int easyHead(const char *URL, const char* *headers, int header_count, bool header_compact);
+int easyGet(const char *URL, int flags, const char* *headers, int header_count, bool header_compact);
+int easyPost(const char *URL, int flags, const char *body, unsigned int bodyBytes, const char* *headers, int header_count, bool header_compact);
+int easyHead(const char *URL, int flags, const char* *headers, int header_count, bool header_compact);
 
 int luaopen_libhttps(lua_State* L);
 

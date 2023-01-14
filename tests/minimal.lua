@@ -90,18 +90,9 @@ end
 
 -- do that again, but this time we will also print out the body
 function callbacks:complete(hid, url, msg, code, sz, read)
-		print ("\t" .. url .. " is complete.")
-		body = {}
-		-- the complete callback returns a function read() that will put the body chunk by chunk into a table (integer keys 1, 2, etc)
-		-- it returns true when complete
-		while (read(body)) do end
-		-- just dump each to the console
-		for i, v in ipairs(body) do
-			print ("\t\tChunk " .. i)
-			print ("----------------------------------------")
-			print (v)
-			print ("----------------------------------------")
-		end
+		print ("\t" .. url .. " is complete, " .. sz .. " bytes total.")
+		-- get the body as a lua string and dump it out
+		print (https.body(hid))
 		-- all done
 		https.release(hid)
 		self.handle[hid] = nil

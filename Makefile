@@ -4,9 +4,9 @@ OPTFLAGS ?= -o3
 OBJS = ./obj/
 SRCS = ./src/
 
-WLIBS = -lwinhttp ./lib/lua51.dll
+WLIBS = -lwinhttp ./lib/lua51.dll ./lib/libpcre2-8.mingw64.a
 MLIBS = -framework Foundation ./lib/libluajit.dylib
-LLIBS = -lpthread -lcurl ./lib/lua51.so
+LLIBS = -lpthread -lcurl -lluajit-5.1 -lpcre2-8
 
 windows: $(OBJS)libhttps.dll
 

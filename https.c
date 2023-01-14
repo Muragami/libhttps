@@ -14,33 +14,31 @@
 #include <stdio.h>
 #include <sys/time.h>
 
-
-
 // maximum simultaneous requests allowed
 #define MAX_REQUEST 128
 // maximum headers allowed in a request
 #define MAX_HEADERS 256
+// maximum number of possible fixed buffers (and never ever more than 65536)
+#define MAX_FIXED_BUFFERS 128
+
+#define BUFFER_USE_BIT  0x10000000
+#define BUFFER_ID(x)    (x & 0x0FFFFFFF)
+
+httpsMemoryInterface mem = { malloc, calloc, realloc, free };
 
 typedef struct _headers {
     char *str[MAX_HEADERS*2];
     int last;
 } headers;
 
-typedef struct _readBuffer {
-    unsigned char *data;
-    unsigned int end;
-    void* nextBuffer;
-} readBuffer;
-
 typedef struct _httpsReq {
     void *request;
     void *res;
-    void *mutex;
+    pthread_mutex_t mutex;
     int index;
+    int flags;
     char *URL;
-    readBuffer *read;
-    readBuffer *last;
-    unsigned int readBufferSize;
+    memBuffer buffer;
     bool complete;
     bool finished;
     bool headerDone;
@@ -52,113 +50,178 @@ typedef struct _httpsReq {
     char *body;
     void *userData;
     httpsHeaderLister lister;
+    httpsFlush flush;
     // metrics
     double startTime;
 } httpsReq;
 
-unsigned int _bufferSize = 0;
-httpsReq* _requestTable[MAX_REQUEST];
-pthread_mutex_t _mainLock;
+typedef struct _httpsContext {
+    unsigned int bufferSize;
+    unsigned long bufferBytes;
+    int requestCount;
+    int persistentBufferCount;
+    pthread_mutex_t mainLock;
+    httpsReq* requestTable[MAX_REQUEST];
+    memBuffer* persistentBuffer;
+    httpsReq requestBacker[MAX_REQUEST];
+    httpsFlush flush;
+} httpsContext;
 
-static inline double _getSeconds()
-{
+httpsContext con = { 0, 0, 0, 0 };
+
+static inline double _getSeconds() {
     struct timeval currentTime;
     gettimeofday(&currentTime, NULL);
     return (double)currentTime.tv_sec + (double)currentTime.tv_usec * 0.0000001;
 }
 
-httpsReq* _newHttpsReq()
-{
+httpsReq* _newHttpsReq(int flags) {
     httpsReq* req = NULL;
     int i;
+
+    pthread_mutex_lock(&con.mainLock);
+
     for (i = 0; i < MAX_REQUEST; i++)
-        if (_requestTable[i] == NULL) break;
+        if (con.requestTable[i] == NULL) break;
 
-    if (i == MAX_REQUEST) return NULL;
-
-    req = calloc(1, sizeof(httpsReq));
+    if (i == MAX_REQUEST) {
+        pthread_mutex_unlock(&con.mainLock);
+        return NULL;
+    }
+    // pull an allocated request and make it live in the system
+    req = con.requestTable[i] = &con.requestBacker[i];
+    // properly configure the request
     req->index = i;
-    req->mutex = malloc(sizeof(pthread_mutex_t));
-    pthread_mutex_init((pthread_mutex_t*)req->mutex, NULL);
-    req->read = calloc(1, sizeof(readBuffer));
-    req->read->data = calloc(1, _bufferSize);
-    req->readBufferSize = _bufferSize;
-    req->last = req->read;
+    req->flags = flags;
+    if (flags & HTTPS_FIXED_BUFFER) {
+        // we want a fixed buffer for this request, so reflect that
+        req->buffer.data = mem.malloc(HTTPS_BUFFER_KB(flags));
+        if (req->buffer.data == NULL) return NULL;
+        req->buffer.length = HTTPS_BUFFER_KB(flags);
+    } else {
+        req->buffer.data = mem.malloc(con.bufferSize);
+        if (req->buffer.data == NULL) return NULL;
+        req->buffer.length = con.bufferSize;
+    }
+    con.bufferBytes += req->buffer.length;    
+    pthread_mutex_init((pthread_mutex_t*)&req->mutex, NULL);
     req->headerDone = req->complete = req->finished = false;
+    req->flush = con.flush;
+    req->buffer.end = 0;
+    req->readTotalBytes = 0;
     req->startTime = _getSeconds();
+    req->returnCode = 0;
+    req->bodyTotalBytes = 0;
+    req->contentTotalBytes = 0;
+    req->contentMimeType = NULL;
+    req->userData = NULL;
 
-    pthread_mutex_lock(&_mainLock);
-    _requestTable[i] = req;
-    pthread_mutex_unlock(&_mainLock);
+    pthread_mutex_unlock(&con.mainLock);
+
     return req;
 }
 
-void _delHttpsReq(httpsReq *p)
-{
-    _requestTable[p->index] = NULL;
-    // free read buffers
-    readBuffer *b = p->read;
-    readBuffer *o;
-    while (b != NULL) {
-        free(b->data);
-        o = b;
-        b = b->nextBuffer;
-        free(o);
-    }
+void _delHttpsReq(httpsReq *p) {
+    con.requestTable[p->index] = NULL;
+    // free read buffer
+    free(p->buffer.data);
+    con.bufferBytes -= p->buffer.length;
     // free the mutex
-    pthread_mutex_destroy((pthread_mutex_t*)p->mutex);
+    pthread_mutex_destroy((pthread_mutex_t*)&p->mutex);
     // free the request itself
     naettClose((naettRes*)p->res);
     naettFree((naettReq*)p->request);
-
-    free(p);
 }
 
-int _bodyWriter(const void* source, int bytes, void* userData)
-{
+int _bodyWriter(const void* source, int bytes, void* userData) {
     httpsReq *r = (httpsReq*)userData;
-    readBuffer *p = r->last;
+    memBuffer *p = &r->buffer;
+    const char* src = (const char*)source;
     r->headerDone = true;
     int toWrite = bytes;
     int nibble;
     while (toWrite > 0) {
-        unsigned int b = _bufferSize - p->end;
+        unsigned int b = p->length - p->end;
         if (toWrite > b) nibble = b;
             else nibble = toWrite;
-        memcpy(p->data + p->end, source, nibble);
+        memcpy(p->data + p->end, src, nibble);
         toWrite -= nibble;
+        src += nibble;
         p->end += nibble;
         r->readTotalBytes += nibble;
-        if (p->end == _bufferSize)
+        if (p->end == p->length)
         {
-            p->nextBuffer = calloc(1, sizeof(readBuffer));
-            if (p->nextBuffer == NULL) return 0;
-            p = p->nextBuffer;
-            p->data = calloc(1, _bufferSize);
-            if (p->data == NULL) return 0;
-            r->last = p;
+            if (r->flags & HTTPS_REUSE_BUFFER) {
+                // do a flush callback and then just reset this buffer
+                r->flush(r->index, r->URL, r->userData, p);
+                p->end = 0;
+            }
+            // if this is a fixed buffer we are done, so close out this writing call
+            if (r->flags & HTTPS_FIXED_BUFFER) return 0;
+            // just forever double?
+            if HTTPS_DOUBLE_FOREVER(r->flags) {
+                p->data = mem.realloc(p->data, p->length * 2);
+                if (p->data == NULL) return 0;
+                con.bufferBytes += p->length;
+                p->length *= 2;
+            } else {
+                if (r->flags & HTTPS_DOUBLE_UNTIL) {
+                    if (p->length < (HTTPS_BUFFER_KB(r->flags) * 1024)) {
+                        p->data = mem.realloc(p->data, p->length * 2);
+                        if (p->data == NULL) return 0;
+                        p->length *= 2;
+                        con.bufferBytes += (p->length >> 1);
+                    } else {
+                        p->data = mem.realloc(p->data, p->length + HTTPS_BUFFER_KB(r->flags) * 1024);
+                        if (p->data == NULL) return 0;
+                        p->length += HTTPS_BUFFER_KB(r->flags) * 1024;
+                        con.bufferBytes += HTTPS_BUFFER_KB(r->flags) * 1024;
+                    }
+                }
+            }
         }
     }
     return bytes;
 }
 
+void httpsSetFlushRoutine(httpsFlush f) {
+    con.flush = f;
+}
+
+void httpsEnsurePersistentBuffers(int x) {
+    x = HTTPS_PERSIST_ID(x);
+    if (x >= con.persistentBufferCount) {
+        mem.realloc(con.persistentBuffer, sizeof(memBuffer) * x);
+        for (int i = con.persistentBufferCount; i < x; i++) {
+            con.persistentBuffer[i].data = NULL;
+            con.persistentBuffer[i].end = HTTPS_OPEN_BUFFER;
+        }
+        con.persistentBufferCount = x;
+    }
+}
+
+int httpsAddPersistentBuffer(char *bmem, unsigned int bytes);
+void httpsRemovePersistentBuffer(int id);
+
 void httpsInit(httpsInitData init, unsigned int readBufferSize)
 {
-    setvbuf (stdout, (char*)NULL, _IONBF, BUFSIZ);
+    // for some console debugging REMOVE
+    // setvbuf (stdout, (char*)NULL, _IONBF, BUFSIZ);
+    // set all memory in our context to zero
+    memset(&con, 0, sizeof(httpsContext));
+    // initialize
     naettInit((naettInitData)init);
-    _bufferSize = readBufferSize;
-    if (_bufferSize == 0) _bufferSize = 16384;
-    for (int i = 0; i < MAX_REQUEST; i++)
-        _requestTable[i] = NULL;
-    pthread_mutex_init(&_mainLock, NULL);
+    con.bufferSize = readBufferSize;
+    if (con.bufferSize == 0) con.bufferSize = 16384;
+    pthread_mutex_init(&con.mainLock, NULL);
 }
 
 void httpsCleanup()
 {
-    pthread_mutex_lock(&_mainLock);
+    pthread_mutex_lock(&con.mainLock);
     for (int i = 0; i < MAX_REQUEST; i++)
     {
-        httpsReq* r = _requestTable[i];
+        httpsReq* r = con.requestTable[i];
         if (r != NULL) {
             if (r->complete && r->finished) {
                 // delete it
@@ -167,19 +230,20 @@ void httpsCleanup()
                 // force it to end
                 naettClose((naettRes*)r->res);
                 naettFree((naettReq*)r->request);
-                _requestTable[i] = NULL;
+                con.requestTable[i] = NULL;
             }    
         }
     }
-    pthread_mutex_unlock(&_mainLock);
+    pthread_mutex_unlock(&con.mainLock);
 }
 
 void httpsUpdate()
 {
-    pthread_mutex_lock(&_mainLock);
+    pthread_mutex_lock(&con.mainLock);
+    if (con.bufferSize == 0) httpsInit(NULL, 0);
     for (int i = 0; i < MAX_REQUEST; i++)
     {
-        httpsReq* r = _requestTable[i];
+        httpsReq* r = con.requestTable[i];
         if (r != NULL) {
             // if we are done totally, free the request so it can be deleted,
             // opening the slot it's taking
@@ -207,16 +271,16 @@ void httpsUpdate()
             
         }
     }
-    pthread_mutex_unlock(&_mainLock);
+    pthread_mutex_unlock(&con.mainLock);
 }
 
 unsigned int httpsRequestCount()
 {
     unsigned int ret = 0;
-    pthread_mutex_lock(&_mainLock);
+    pthread_mutex_lock(&con.mainLock);
     for (int i = 0; i < MAX_REQUEST; i++)
-        if (_requestTable[i] != NULL) ret++;
-    pthread_mutex_unlock(&_mainLock);
+        if (con.requestTable[i] != NULL) ret++;
+    pthread_mutex_unlock(&con.mainLock);
     return ret;
 }
 
@@ -245,11 +309,11 @@ void* _makeRequest(httpsReq* r, const char *method, void* _headers, unsigned int
     }
 }
 
-void* httpsGet(const char *URL, void *headers)
+void* httpsGet(const char *URL, int flags,  void *headers)
 {
     httpsReq* r;
-    if ((_bufferSize == 0) || (URL == NULL) || (strlen(URL) == 0)) return NULL;
-    r = _newHttpsReq();
+    if ((con.bufferSize == 0) || (URL == NULL) || (strlen(URL) == 0)) return NULL;
+    r = _newHttpsReq(flags);
     if (r == NULL) return NULL;
     r->URL = strdup(URL);
     r->request = _makeRequest(r, "GET", headers, 0, NULL);
@@ -258,11 +322,11 @@ void* httpsGet(const char *URL, void *headers)
     return (void*)r;
 }
 
-void* httpsPost(const char *URL, const char *body, unsigned int bodyBytes, void *headers)
+void* httpsPost(const char *URL, int flags,  const char *body, unsigned int bodyBytes, void *headers)
 {
     httpsReq* r;
-    if ((_bufferSize == 0) || (URL == NULL) || (strlen(URL) == 0)) return NULL;
-    r = _newHttpsReq();
+    if ((con.bufferSize == 0) || (URL == NULL) || (strlen(URL) == 0)) return NULL;
+    r = _newHttpsReq(flags);
     if (r == NULL) return NULL;
     r->URL = strdup(URL);
     if (bodyBytes == 0) {
@@ -281,11 +345,11 @@ void* httpsPost(const char *URL, const char *body, unsigned int bodyBytes, void 
     return (void*)r;
 }
 
-void* httpsPostLinked(const char *URL, const char *body, unsigned int bodyBytes, void *headers)
+void* httpsPostLinked(const char *URL, int flags,  const char *body, unsigned int bodyBytes, void *headers)
 {
     httpsReq* r;
-    if ((_bufferSize == 0) || (URL == NULL) || (strlen(URL) == 0)) return NULL;
-    r = _newHttpsReq();
+    if ((con.bufferSize == 0) || (URL == NULL) || (strlen(URL) == 0)) return NULL;
+    r = _newHttpsReq(flags);
     if (r == NULL) return NULL;
     r->URL = strdup(URL);
     if (bodyBytes == 0) {
@@ -303,11 +367,11 @@ void* httpsPostLinked(const char *URL, const char *body, unsigned int bodyBytes,
     return (void*)r;
 }
 
-void* httpsHead(const char *URL, void *headers)
+void* httpsHead(const char *URL, int flags,  void *headers)
 {
     httpsReq* r;
-    if ((_bufferSize == 0) || (URL == NULL) || (strlen(URL) == 0)) return NULL;
-    r = _newHttpsReq();
+    if ((con.bufferSize == 0) || (URL == NULL) || (strlen(URL) == 0)) return NULL;
+    r = _newHttpsReq(flags);
     if (r == NULL) return NULL;
     r->URL = strdup(URL);
     r->request = _makeRequest(r, "HEAD", headers, 0, NULL);
@@ -320,19 +384,19 @@ int httpsGetCode(void *p)
 {
     httpsReq *r = (httpsReq*)p;
     int ret;
-    pthread_mutex_lock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
     ret = naettGetStatus((naettRes*)r);
-    pthread_mutex_unlock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
     return ret;
 }
 
 int httpsGetCodeI(int i)
 {
-    httpsReq *r = _requestTable[i];
+    httpsReq *r = con.requestTable[i];
     int ret;
-    pthread_mutex_lock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
     ret = naettGetStatus((naettRes*)r);
-    pthread_mutex_unlock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
     return ret;
 }
 
@@ -340,9 +404,9 @@ const char* httpsGetHeader(void *p, const char *w)
 {
     httpsReq *r = (httpsReq*)p;
     const char *ret;
-    pthread_mutex_lock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
     ret = naettGetHeader((naettRes*)r->res, w);
-    pthread_mutex_unlock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
     return ret;
 }
 
@@ -355,28 +419,28 @@ int _HeaderLister(const char* name, const char* value, void* userData)
 void httpsListHeaders(void *p, httpsHeaderLister lister)
 {
     httpsReq *r = (httpsReq*)p;
-    pthread_mutex_lock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
     r->lister = lister;
     naettListHeaders((naettRes*)r->res, _HeaderLister, (void*)r);
-    pthread_mutex_unlock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
 }
 
 bool httpsIsComplete(void *p)
 {
     httpsReq *r = (httpsReq*)p;
     bool ret = false;
-    pthread_mutex_lock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
     ret = r->complete;
-    pthread_mutex_unlock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
     return ret;
 }
 
 void httpsFinished(void *p)
 {
     httpsReq *r = (httpsReq*)p;
-    pthread_mutex_lock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
     r->finished = true;
-    pthread_mutex_unlock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
 }
 
 void* httpsNewHeaders()
@@ -414,37 +478,28 @@ unsigned int httpsGetBodyLength(void *p)
 {
     httpsReq *r = (httpsReq*)p;
     unsigned int ret;
-    pthread_mutex_lock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
     ret = r->readTotalBytes;
-    pthread_mutex_unlock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
     return ret;
 }
 
 void httpsGetBody(void *p, unsigned int maxBytes)
 {
+    unsigned int len = maxBytes;
     httpsReq *r = (httpsReq*)p;
-    pthread_mutex_lock((pthread_mutex_t*)r->mutex);
-    unsigned int toWrite = r->readTotalBytes;
-    if (toWrite > maxBytes) toWrite = maxBytes;
-    unsigned int bCount = toWrite / r->readBufferSize;
-    unsigned int last = toWrite - (bCount * r->readBufferSize);
-    unsigned int pos = 0;
-    readBuffer *b = r->read;
-    while (bCount-- > 0) {
-        memcpy(p + pos, b->data, r->readBufferSize);
-        pos += r->readBufferSize;
-        b = b->nextBuffer;
-    }
-    if (last > 0) memcpy(p + pos, b->data, last);
-    pthread_mutex_unlock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
+    if (len > r->buffer.end) len = r->buffer.end;
+    memcpy(p, r->buffer.data, len);
+    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
 }
 
 void httpsRelease(void *p)
 {
     httpsReq *r = (httpsReq*)p;
-    pthread_mutex_lock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
     r->finished = true;
-    pthread_mutex_unlock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
 }
 
 #ifdef _WIN32
@@ -495,11 +550,11 @@ headers *_easyCreateHeaders(const char* *_headers, int header_count, bool compac
 
 const char* _easyGetHeader(int i, const char *header)
 {
-    httpsReq* r = _requestTable[i];
+    httpsReq* r = con.requestTable[i];
     const char *ret;
-    pthread_mutex_lock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_lock((pthread_mutex_t*)&r->mutex);
     ret = naettGetHeader((naettRes*)r->res, header);
-    pthread_mutex_unlock((pthread_mutex_t*)r->mutex);
+    pthread_mutex_unlock((pthread_mutex_t*)&r->mutex);
     return ret;
 }
 
@@ -511,7 +566,6 @@ typedef struct _easyData {
     unsigned int readTotalBytes;
     unsigned int contentTotalBytes;
     char *contentMimeType;
-    readBuffer *read;
 } easyData;
 
 typedef struct _easyMetric {
@@ -545,24 +599,6 @@ double _easyDelay = 0.0;
 #define EASY_METRIC_REMAINING   7
 #define EASY_METRIC_RUNTIME     8
 
-void _easyReadResponse(int i, char* data, int *bytes, bool *complete)
-{
-    httpsReq* r = _requestTable[i];
-    easyData *d = (easyData*)r->userData;
-    pthread_mutex_lock((pthread_mutex_t*)r->mutex);
-    if (data == NULL)
-    {
-        *bytes = r->readTotalBytes;
-        return;
-    }
-    if (d->read == NULL) d->read = r->read;
-    *bytes = d->read->end;
-    memcpy(data, d->read->data, d->read->end);
-    d->read = d->read->nextBuffer;
-    *complete = (d->read == NULL);
-    pthread_mutex_unlock((pthread_mutex_t*)r->mutex);    
-}
-
 void easySetup(easyCallback cb, unsigned int bsize)
 {
     httpsInit(NULL, bsize);
@@ -571,7 +607,7 @@ void easySetup(easyCallback cb, unsigned int bsize)
 
 void easyListHeaders(int h, httpsHeaderLister lister)
 {
-    httpsListHeaders(_requestTable[h], lister);
+    httpsListHeaders(con.requestTable[h], lister);
 }
 
 void easyOptionUI(unsigned int opt, unsigned int val) {
@@ -655,12 +691,11 @@ void easyUpdate()
 {
     int mcnt = 0;
     double secs;
-    if (_bufferSize == 0) httpsInit(NULL, 0);
     httpsUpdate();
-    pthread_mutex_lock(&_mainLock);
+    pthread_mutex_lock(&con.mainLock);
     for (int i = 0; i < MAX_REQUEST; i++)
     {
-        httpsReq* r = _requestTable[i];
+        httpsReq* r = con.requestTable[i];
         if (r != NULL) {
             easyData *d = (easyData*)r->userData;
             // here we go, check for needed callbacks, etc.
@@ -692,25 +727,25 @@ void easyUpdate()
             }
             if (r->complete != d->complete) {
                 // response is complete, so let the caller know
-                _theEasyCallback(i, r->URL, "COMPLETE", r->returnCode, r->readBufferSize, (void*)_easyReadResponse);
+                _theEasyCallback(i, r->URL, "COMPLETE", r->returnCode, r->buffer.end, (void*)&r->buffer);
                 d->returnCode = r->returnCode;
                 httpsRelease(r);
             }
         }
     }
-    pthread_mutex_unlock(&_mainLock);
+    pthread_mutex_unlock(&con.mainLock);
     
     // are we doing metrics? if so update them
     if EASY_METRICS {
         secs = _getSeconds();
-        pthread_mutex_lock(&_mainLock);
+        pthread_mutex_lock(&con.mainLock);
         // empty the metric table (just mark every entry invalid)
         for (int i = 0; i < MAX_REQUEST; i++)
             _metricTable[i].handle = -1;
         // see what metrics we have to collect!
         for (int i = 0; i < MAX_REQUEST; i++)
         {
-            httpsReq* r = _requestTable[i];
+            httpsReq* r = con.requestTable[i];
             if (r != NULL) {
                 _metricTable[mcnt].handle = i;
                 _metricTable[mcnt].url = r->URL;
@@ -726,56 +761,56 @@ void easyUpdate()
                 } else _metricTable[mcnt].estimatedRemainingTime = 0.0f;
             }
         }
-        pthread_mutex_unlock(&_mainLock);
+        pthread_mutex_unlock(&con.mainLock);
     }
 
     // sleep for the request delay amount if we are being nice
     if (_easyDelay > 0.0) usleep((useconds_t)(_easyDelay * 1000000));
 }
 
-int easyGet(const char *URL, const char* *_headers, int header_count, bool header_compact)
+int easyGet(const char *URL, int flags, const char* *_headers, int header_count, bool header_compact)
 {
     headers *h;
     httpsReq *r;
     if ((header_count > 0) && (_headers != NULL))
     {
         h = _easyCreateHeaders(_headers, header_count, header_compact);
-        r = httpsGet(URL, h);
+        r = httpsGet(URL, flags, h);
         httpsDelHeaders(h);
     } else
-        r = httpsGet(URL, NULL);
+        r = httpsGet(URL, flags, NULL);
     r->userData = calloc(1, sizeof(easyData));
     _theEasyCallback(r->index, r->URL, "START", r->returnCode, 0, NULL);
     return r->index;
 }
 
-int easyPost(const char *URL, const char *body, unsigned int bodyBytes, const char* *_headers, int header_count, bool header_compact)
+int easyPost(const char *URL, int flags, const char *body, unsigned int bodyBytes, const char* *_headers, int header_count, bool header_compact)
 {
     headers *h;
     httpsReq *r;
     if ((header_count > 0) && (_headers != NULL))
     {
         h = _easyCreateHeaders(_headers, header_count, header_compact);
-        r = httpsPost(URL, body, bodyBytes, h);
+        r = httpsPost(URL, flags, body, bodyBytes, h);
         httpsDelHeaders(h);
     } else
-        r = httpsPost(URL, body, bodyBytes, NULL);
+        r = httpsPost(URL, flags, body, bodyBytes, NULL);
     r->userData = calloc(1, sizeof(easyData));
     _theEasyCallback(r->index, r->URL, "START", r->returnCode, 0, NULL);
     return r->index;
 }
 
-int easyHead(const char *URL, const char* *_headers, int header_count, bool header_compact)
+int easyHead(const char *URL, int flags, const char* *_headers, int header_count, bool header_compact)
 {
     headers *h;
     httpsReq *r;
     if ((header_count > 0) && (_headers != NULL))
     {
         h = _easyCreateHeaders(_headers, header_count, header_compact);
-        r = httpsHead(URL, h);
+        r = httpsHead(URL, flags, h);
         httpsDelHeaders(h);
     } else
-        r = httpsHead(URL, NULL);
+        r = httpsHead(URL, flags, NULL);
     r->userData = calloc(1, sizeof(easyData));
     _theEasyCallback(r->index, r->URL, "START", r->returnCode, 0, NULL);
     return r->index;
@@ -819,31 +854,6 @@ int lua_ReadHeader(lua_State* L)
     return 1;
 }
 
-int lua_ReadResponse(lua_State* L)
-{
-    void (*ReadResponse)(int i, char* data, int *bytes, bool *complete);
-    ReadResponse = lua_touserdata(L, lua_upvalueindex(2));
-    if (lua_isnoneornil(L, 1)) {
-        // just return the total bytes of this response
-        int bytes;
-        ReadResponse(lua_tointeger(L, lua_upvalueindex(1)), NULL, &bytes, NULL);
-        lua_pushinteger(L, bytes);
-        return 1;
-    } else if (lua_istable(L, 1)) {
-        // return a string for this buffer chunk of the response
-        char *buffer = calloc(1, lua_tointeger(L, lua_upvalueindex(3)) + 16);
-        int bytes = 0;
-        bool done;
-        ReadResponse(lua_tointeger(L, lua_upvalueindex(1)), buffer, &bytes, &done);
-        lua_pushinteger(L, lua_objlen(L, 1) + 1);
-        lua_pushlstring(L, buffer, bytes + 1);
-        lua_rawset(L, 1);
-        lua_pushboolean(L, !done);
-        return 1;
-    } else luaL_error(L, "https callback ReadResponse() function must be called with a table to populate!");
-    return 0;
-}
-
 void lua_Callback(int handle, const char* url, const char* msg, int code, unsigned int sz, void* data)
 {
     int t = lua_gettop(lState);
@@ -876,10 +886,7 @@ void lua_Callback(int handle, const char* url, const char* msg, int code, unsign
                     lua_pushcclosure(lState, lua_ReadHeader, 2);
                 }
                 if (cbm == EASY_CB_COMPLETE) {
-                    lua_pushinteger(lState, handle);
                     lua_pushlightuserdata(lState, data);
-                    lua_pushinteger(lState, sz);
-                    lua_pushcclosure(lState, lua_ReadResponse, 3);
                 }
             } else lua_pushnil(lState);
             lua_call(lState, 7, 0);
@@ -930,9 +937,9 @@ int lua_Get(lua_State* L) {
             }
             lua_pop(L, 1);
         }
-        r = easyGet(url, head, i, false);
+        r = easyGet(url, 0, head, i, false);
     } else {
-        r = easyGet(url, NULL, 0, false);
+        r = easyGet(url, 0, NULL, 0, false);
     }
     lua_getregtable(L);
     lua_assert_init(L);
@@ -982,9 +989,9 @@ int lua_Post(lua_State* L) {
             }
             lua_pop(L, 1);
         }
-        r = easyPost(url, body, bbytes, head, i, false);
+        r = easyPost(url, 0, body, bbytes, head, i, false);
     } else {
-        r = easyPost(url, body, bbytes, NULL, 0, false);
+        r = easyPost(url, 0, body, bbytes, NULL, 0, false);
     }
     lua_getregtable(L);
     lua_assert_init(L);
@@ -1030,9 +1037,9 @@ int lua_Head(lua_State* L) {
             }
             lua_pop(L, 1);
         }
-        r = easyHead(url, head, i, false);
+        r = easyHead(url, 0, head, i, false);
     } else {
-        r = easyHead(url, NULL, 0, false);
+        r = easyHead(url, 0, NULL, 0, false);
     }
     lua_getregtable(L);
     lua_assert_init(L);
@@ -1180,7 +1187,34 @@ int lua_List(lua_State* L) {
     int h = luaL_checkinteger(L, 1);
     if ((h < 0) || (h >= MAX_REQUEST)) luaL_error(L, "https.list() called with out of range value %d", h);
     lua_newtable(L);
-    httpsListHeaders(_requestTable[h], lua_HeaderLister);
+    httpsListHeaders(con.requestTable[h], lua_HeaderLister);
+    return 1;
+}
+
+/* 
+    https.body(handle)
+    https.body(handle, start)
+    https.body(handle, start, end)
+
+    handle integer of the request (if no start or end all the body)
+    start integer of the first byte (if no end, start until end of body)
+        - lua style, start byte is 1
+    end integer of the first byte
+
+    returns a string with the body contents (or a slice of it) for the response
+*/
+int lua_Body(lua_State* L) {
+    int h = luaL_checkinteger(L, 1);
+    unsigned int start, end;
+    if ((h < 0) || (h >= MAX_REQUEST)) luaL_error(L, "https.body() called with out of range value %d", h);
+    httpsReq *r = con.requestTable[h];
+    if (lua_isnumber(L, 2)) start = lua_tointeger(L, 2);
+        else start = 0;
+    if (lua_isnumber(L, 3)) end = lua_tointeger(L, 3);
+        else end = r->buffer.end;
+    if (start < 1) start = 1;
+    if (end < start) lua_pushstring(L, "");
+        else lua_pushlstring(L, (const char*)r->buffer.data + start - 1, end - start + 1);
     return 1;
 }
 
@@ -1194,7 +1228,7 @@ int lua_List(lua_State* L) {
 int lua_Release(lua_State* L) {
     int h = luaL_checkinteger(L, 1);
     if ((h < 0) || (h >= MAX_REQUEST)) luaL_error(L, "https.release() called with out of range value %d", h);
-    httpsFinished(_requestTable[h]);
+    httpsFinished(con.requestTable[h]);
     return 0;
 }
 
@@ -1210,6 +1244,7 @@ luaL_Reg lfunc[] = {
     { "get", lua_Get  },
     { "post", lua_Post  },
     { "head", lua_Head  },
+    { "body", lua_Body  },
     { NULL, NULL },
 };
 
