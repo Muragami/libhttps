@@ -98,7 +98,10 @@ httpsReq* _newHttpsReq(int flags) {
         req->buffer.data = mem.malloc(HTTPS_BUFFER_KB(flags));
         if (req->buffer.data == NULL) return NULL;
         req->buffer.length = HTTPS_BUFFER_KB(flags);
+    } else if (flags & HTTPS_FIXED_BUFFER) {
+        // we are using a persistent buffer, so make that happen
     } else {
+        // allocate a buffer for this locally
         req->buffer.data = mem.malloc(con.bufferSize);
         if (req->buffer.data == NULL) return NULL;
         req->buffer.length = con.bufferSize;
@@ -124,7 +127,13 @@ httpsReq* _newHttpsReq(int flags) {
 void _delHttpsReq(httpsReq *p) {
     con.requestTable[p->index] = NULL;
     // free read buffer
-    free(p->buffer.data);
+    if (p->flags & HTTPS_PERSISTENT_BUFFER) {
+        // we don't free the buffer, but have to let the system know we aren't using it anymore
+
+    } else {
+        // just free the allocated buffer for this request
+        mem.free(p->buffer.data);    
+    }
     con.bufferBytes -= p->buffer.length;
     // free the mutex
     pthread_mutex_destroy((pthread_mutex_t*)&p->mutex);
@@ -184,15 +193,24 @@ int _bodyWriter(const void* source, int bytes, void* userData) {
     return bytes;
 }
 
+/*
+    Set the default flush routine for all requests.
+*/
 void httpsSetFlushRoutine(httpsFlush f) {
     con.flush = f;
 }
 
+/*
+    Ensure we have (int x) buffers available, expand our persistent buffer table as needed.
+
+    By default we allocate 0, so if you want to use them, call this first.
+*/
 void httpsEnsurePersistentBuffers(int x) {
     x = HTTPS_PERSIST_ID(x);
     if (x >= con.persistentBufferCount) {
         mem.realloc(con.persistentBuffer, sizeof(memBuffer) * x);
         for (int i = con.persistentBufferCount; i < x; i++) {
+            con.persistentBuffer[i].flags = 0;
             con.persistentBuffer[i].data = NULL;
             con.persistentBuffer[i].end = HTTPS_OPEN_BUFFER;
         }
@@ -200,8 +218,63 @@ void httpsEnsurePersistentBuffers(int x) {
     }
 }
 
-int httpsAddPersistentBuffer(char *bmem, unsigned int bytes);
-void httpsRemovePersistentBuffer(int id);
+/*
+    Add a new persistent buffer to use later, a couple options to call:
+
+        int ret = httpsAddPersistentBuffer(NULL, size);
+
+            Allocate a new buffer of size bytes and return it's identifier
+
+        int ret = httpsAddPersistentBuffer(pBuffer, size);
+
+            Add a buffer of size bytes that already exists to the table.
+
+    returns the handle id of the persistent buffer to pass to a request later
+*/
+int httpsAddPersistentBuffer(char *bmem, unsigned int bytes)
+{
+    int i;
+    for (i = 0; i < con.persistentBufferCount; i++) {
+        if (con.persistentBuffer[i].end == HTTPS_OPEN_BUFFER) break;
+    }
+    // grow the buffers as needed if we didn't alread allocate enough
+    if (i == con.persistentBufferCount) {
+        int npbc = con.persistentBufferCount * 2;
+        if (npbc == 0) npbc = 128;
+        // if we will exceed the allowed 65536 buffers, just fail instead
+        if (npbc > 0xFFFF) return -1;
+        httpsEnsurePersistentBuffers(npbc);
+    }
+    con.persistentBuffer[i].end = bytes;
+    if (bmem == NULL) {
+        con.persistentBuffer[i].data = mem.malloc(bytes);
+        if (con.persistentBuffer[i].data == NULL) {
+            return -1;
+        }
+    } else {
+        con.persistentBuffer[i].data = (unsigned char*)bmem;
+        con.persistentBuffer[i].flags = HTTPS_MEMBUFFER_FOREIGN;
+    }
+    return i;
+}
+
+/*
+    Remove (free for use later) persistent buffer handle id
+*/
+void httpsRemovePersistentBuffer(int id)
+{
+    if ((id < 0) || (id >= con.persistentBufferCount)) return;
+    if (con.persistentBuffer[id].flags & HTTPS_MEMBUFFER_FOREIGN)
+    {
+        con.persistentBuffer[id].end = HTTPS_OPEN_BUFFER;
+        con.persistentBuffer[id].flags = 0;
+        con.persistentBuffer[id].data = NULL;
+        return;
+    }
+    mem.free(con.persistentBuffer[id].data);
+    con.persistentBuffer[id].end = HTTPS_OPEN_BUFFER;
+    con.persistentBuffer[id].data = NULL;
+}
 
 void httpsInit(httpsInitData init, unsigned int readBufferSize)
 {

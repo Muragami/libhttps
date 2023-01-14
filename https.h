@@ -26,10 +26,13 @@ typedef struct _httpsMemoryInterface {
 } httpsMemoryInterface;
 
 typedef struct _memBuffer {
+    unsigned int flags;
     unsigned int end;
     unsigned long length;
     unsigned char *data;
 } memBuffer;
+
+#define HTTPS_MEMBUFFER_FOREIGN     0x1             // foreign buffer, don't automatically free()
 
 // void* is the httpsReq* that called for this listing, you can get and set *userData in there
 typedef int (*httpsHeaderLister)(const char* name, const char* value, void* r);
