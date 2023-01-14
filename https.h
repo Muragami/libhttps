@@ -26,13 +26,14 @@ typedef struct _httpsMemoryInterface {
 } httpsMemoryInterface;
 
 typedef struct _memBuffer {
-    unsigned int flags;
+    unsigned int index;
     unsigned int end;
     unsigned long length;
     unsigned char *data;
 } memBuffer;
 
-#define HTTPS_MEMBUFFER_FOREIGN     0x1             // foreign buffer, don't automatically free()
+#define HTTPS_MEMBUFFER_FOREIGN     0x10000000      // foreign buffer, don't automatically free()
+#define HTTPS_MEMBUFFER_UNINDEX     0x20000000      // a not indexed buffer
 
 // void* is the httpsReq* that called for this listing, you can get and set *userData in there
 typedef int (*httpsHeaderLister)(const char* name, const char* value, void* r);
@@ -41,7 +42,7 @@ typedef int (*httpsHeaderLister)(const char* name, const char* value, void* r);
 typedef void (*httpsFlush)(int index, const char* URL, void *user, memBuffer *p);
 
 #define HTTPS_FIXED_BUFFER          0x10000000      // a fixed buffer for this request
-#define HTTPS_PERSISTENT_BUFFER     0x20000000      // use an established already existing buffer
+#define HTTPS_PERSISTENT_BUFFER     0x30000000      // use an established already existing buffer (always also fixed size)
 #define HTTPS_REUSE_BUFFER          0x40000000      // reuse a buffer, using a flush callback each time it's full
 #define HTTPS_DOUBLE_UNTIL          0x80000000      // double realloc() until we hit a set size and them just allocated that size over and over (2x, 3x, etc.)
 #define HTTPS_DOUBLE_FOREVER(x)     ((x & 0xF0000000) == 0)      
