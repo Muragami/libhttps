@@ -8,8 +8,7 @@
 
 #ifdef _WIN32
 
-static DWORD timespec_to_ms(const struct timespec *abstime)
-{
+static DWORD timespec_to_ms(const struct timespec *abstime) {
     DWORD t;
 
     if (abstime == NULL)
@@ -21,8 +20,7 @@ static DWORD timespec_to_ms(const struct timespec *abstime)
     return t;
 }
 
-int pthread_mutex_init(pthread_mutex_t *mutex, pthread_mutexattr_t *attr)
-{
+int pthread_mutex_init(pthread_mutex_t *mutex, pthread_mutexattr_t *attr) {
     (void)attr;
 
     if (mutex == NULL)
@@ -32,32 +30,28 @@ int pthread_mutex_init(pthread_mutex_t *mutex, pthread_mutexattr_t *attr)
     return 0;
 }
 
-int pthread_mutex_destroy(pthread_mutex_t *mutex)
-{
+int pthread_mutex_destroy(pthread_mutex_t *mutex) {
     if (mutex == NULL)
         return 1;
     DeleteCriticalSection(mutex);
     return 0;
 }
 
-int pthread_mutex_lock(pthread_mutex_t *mutex)
-{
+int pthread_mutex_lock(pthread_mutex_t *mutex) {
     if (mutex == NULL)
         return 1;
     EnterCriticalSection(mutex);
     return 0;
 }
 
-int pthread_mutex_unlock(pthread_mutex_t *mutex)
-{
+int pthread_mutex_unlock(pthread_mutex_t *mutex) {
     if (mutex == NULL)
         return 1;
     LeaveCriticalSection(mutex);
     return 0;
 }
 
-int pthread_cond_init(pthread_cond_t *cond, pthread_condattr_t *attr)
-{
+int pthread_cond_init(pthread_cond_t *cond, pthread_condattr_t *attr) {
     (void)attr;
     if (cond == NULL)
         return 1;
@@ -65,22 +59,19 @@ int pthread_cond_init(pthread_cond_t *cond, pthread_condattr_t *attr)
     return 0;
 }
 
-int pthread_cond_destroy(pthread_cond_t *cond)
-{
+int pthread_cond_destroy(pthread_cond_t *cond) {
     /* Windows does not have a destroy for conditionals */
     (void)cond;
     return 0;
 }
 
-int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex)
-{
+int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) {
     if (cond == NULL || mutex == NULL)
         return 1;
     return pthread_cond_timedwait(cond, mutex, NULL);
 }
 
-int pthread_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex, const struct timespec *abstime)
-{
+int pthread_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex, const struct timespec *abstime) {
     if (cond == NULL || mutex == NULL)
         return 1;
     if (!SleepConditionVariableCS(cond, mutex, timespec_to_ms(abstime)))
@@ -88,28 +79,40 @@ int pthread_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex, const s
     return 0;
 }
 
-int pthread_cond_signal(pthread_cond_t *cond)
-{
+int pthread_cond_signal(pthread_cond_t *cond) {
     if (cond == NULL)
         return 1;
     WakeConditionVariable(cond);
     return 0;
 }
 
-int pthread_cond_broadcast(pthread_cond_t *cond)
-{
+int pthread_cond_broadcast(pthread_cond_t *cond) {
     if (cond == NULL)
         return 1;
     WakeAllConditionVariable(cond);
     return 0;
 }
 
-unsigned int pcthread_get_num_procs()
-{
+unsigned int pcthread_get_num_procs() {
     SYSTEM_INFO sysinfo;
 
     GetSystemInfo(&sysinfo);
     return sysinfo.dwNumberOfProcessors;
+}
+
+int xthread_create(pthread_t* thread, xthread_ret (*start_routine)(void *), void *arg) {
+    *thread = CreateThread(NULL, 0, start_routine, arg, 0, NULL);
+    return (int)(*thread == NULL);
+}
+
+int xthread_exit(xthread_ret val) {
+    ExitThread(val);
+}
+
+int xthread_join(pthread_t thread, xthread_ret *retval) {
+    WaitForSingleObject(thread, INFINITE);
+    if (retval != NULL) GetExitCodeThread(thread, (LPDWORD)retval);
+    return 0;
 }
 
 #else
@@ -118,8 +121,7 @@ unsigned int pcthread_get_num_procs()
 
 #include <unistd.h>
 
-unsigned int pcthread_get_num_procs()
-{
+unsigned int pcthread_get_num_procs() {
   return sysconf(_SC_NPROCESSORS_ONLN);
 }
 
@@ -128,17 +130,24 @@ unsigned int pcthread_get_num_procs()
 #include <stdio.h>
 #include <sys/sysinfo.h>
 
-unsigned int pcthread_get_num_procs()
-{
+unsigned int pcthread_get_num_procs() {
     return get_nprocs();
 }
 
 #endif
 
+int xthread_create(pthread_t* thread, xthread_ret (*start_routine)(void *), void *arg) {
+    return pthread_create(thread, NULL, start_routine, arg);
+}
+
+int xthread_join(pthread_t thread, xthread_ret *retval) {
+    return pthread_join(thread, retval);
+}
+
+
 #endif
 
-void ms_to_timespec(struct timespec *ts, unsigned int ms)
-{
+void ms_to_timespec(struct timespec *ts, unsigned int ms) {
     if (ts == NULL)
         return;
     ts->tv_sec = (ms / 1000) + time(NULL);

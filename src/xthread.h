@@ -17,6 +17,9 @@
 typedef CRITICAL_SECTION pthread_mutex_t;
 typedef void pthread_mutexattr_t;
 typedef void pthread_condattr_t;
+typedef HANDLE pthread_t;
+typedef void pthread_attr_t;
+typedef DWORD xthread_ret;
 typedef CONDITION_VARIABLE pthread_cond_t;
 
 // only include this defintion if we are not using gcc, because it already has one
@@ -39,10 +42,20 @@ int pthread_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex, const s
 int pthread_cond_signal(pthread_cond_t *cond);
 int pthread_cond_broadcast(pthread_cond_t *cond);
 
+int xthread_create(pthread_t* thread, xthread_ret (*start_routine)(void *), void *arg);
+int xthread_exit(xthread_ret val);
+int xthread_join(pthread_t thread, xthread_ret *retval);
+
 #else
 // *****************************************************************************************************
 // or... just use pthread
 #include <pthread.h>
+
+typedef void* xthread_ret;
+
+int xthread_create(pthread_t* thread, xthread_ret (*start_routine)(void *), void *arg);
+#define xthread_exit(val)   { return val; }
+int xthread_join(pthread_t thread, xthread_ret *retval);
 
 #endif
 

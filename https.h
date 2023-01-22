@@ -18,12 +18,34 @@ typedef JavaVM* httpsInitData;
 typedef void* httpsInitData;
 #endif
 
+#define HTTPS_VERSION_NUM   0x0100
+#define HTTPS_VERSION_STR   "01.00"
+
+// maximum simultaneous requests allowed
+#define MAX_REQUEST 128
+// maximum headers allowed in a request (Apache 2.3 gives us an idea, 100 so we use it)
+#define MAX_HEADERS 100
+// maximum number of possible fixed buffers (and never ever more than 65536)
+#define MAX_FIXED_BUFFERS 128
+
+typedef struct _httpsHeaders {
+    int count;
+    char *str[MAX_HEADERS*2];
+} httpsHeaders;
+
 typedef struct _httpsMemoryInterface {
     void* (*malloc)(size_t bytes);
     void* (*calloc)(size_t sz, size_t count);
     void* (*realloc)(void *p, size_t bytes);
     void  (*free)(void *p);
 } httpsMemoryInterface;
+
+typedef struct _httpsSystemInfo {
+    int numRequests;
+    int maxRequests;
+    int activeRequests;
+    unsigned int bufferBytes;
+} httpsSystemInfo;
 
 typedef struct _memBuffer {
     unsigned int index;
@@ -50,12 +72,14 @@ typedef void (*httpsFlush)(int index, const char* URL, void *user, memBuffer *p)
 #define HTTPS_BUFFER_KB(x)          (x & 0xFFFFFFF) // ~ 255GB is the largest fixed buffer we can support, allocated as 1 kb units
 #define HTTPS_PERSIST_ID(x)         (x & 0xFFFF)    // 65536 possible persistant buffers
 #define HTTPS_OPEN_BUFFER           0xFFFFFFFF      // a buffer end point that is invalid
+#define HTTPS_OPEN_HANDLE           0xFFFFFFFF      // a buffer end point that is invalid
 
 // the low level interface if you want to be fancy
 void httpsInit(httpsInitData init, unsigned int readBufferSize);
 void httpsCleanup();
 void httpsUseMemoryInterface(httpsMemoryInterface *p);
 void httpsSetFlushRoutine(httpsFlush f);
+void httpsGetInfo(httpsSystemInfo *info);
 void httpsEnsurePersistentBuffers(int i);
 int httpsAddPersistentBuffer(char *bmem, unsigned int bytes);
 void httpsRemovePersistentBuffer(int id);
@@ -76,8 +100,8 @@ bool httpsIsComplete(void* p);
 void httpsFinished(void* p);
 unsigned int httpsRequestCount();
 void* httpsNewHeaders();
-void httpsSetHeader(void *p, const char *name, const char *val);
-void httpsDelHeaders(void *p);
+void httpsSetHeader(httpsHeaders *h, const char *name, const char *val);
+void httpsDelHeaders(httpsHeaders *h);
 void httpsRelease(void *p);
 
 //
@@ -97,10 +121,11 @@ typedef struct _easyMessage {
     int code;
     unsigned int sz;
     void *data;
+    unsigned int config[4];
 } easyMessage;
 
 void easySetup(easyCallback cb, unsigned int bsize);
-void easySetupThreaded(unsigned int msgQueDepth, unsigned int slotCount);
+void easySetupThreaded(easyCallback cb, unsigned int msgQueDepth, unsigned int slotCount);
 void easyListHeaders(int h, httpsHeaderLister lister);
 void easyOptionUI(unsigned int opt, unsigned int val);
 void easyOptionD(unsigned int opt, double val);
@@ -112,6 +137,10 @@ void easyUpdate();	// if you call this is counts as calling the low-level httpsU
 int easyGet(const char *URL, int flags, const char* *headers, int header_count, bool header_compact);
 int easyPost(const char *URL, int flags, const char *body, unsigned int bodyBytes, const char* *headers, int header_count, bool header_compact);
 int easyHead(const char *URL, int flags, const char* *headers, int header_count, bool header_compact);
+// if we have headers to just pass through easily, provide that option
+int easyGetPass(const char *URL, int flags, httpsHeaders *h);
+int easyPostPass(const char *URL, int flags, const char *body, unsigned int bodyBytes, httpsHeaders *h);
+int easyHeadPass(const char *URL, int flags, httpsHeaders *h);
 
 int luaopen_libhttps(lua_State* L);
 

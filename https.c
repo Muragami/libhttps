@@ -6,6 +6,7 @@
 
 #include "https.h"
 #include "src/xthread.h"
+#include "src/memio.h"
 #include <unistd.h>
 #include <ctype.h>
 #include <string.h>
@@ -13,13 +14,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/time.h>
-
-// maximum simultaneous requests allowed
-#define MAX_REQUEST 128
-// maximum headers allowed in a request
-#define MAX_HEADERS 256
-// maximum number of possible fixed buffers (and never ever more than 65536)
-#define MAX_FIXED_BUFFERS 128
 
 #define BUFFER_USE_BIT  0x10000000
 #define BUFFER_ID(x)    (x & 0x0FFFFFFF)
@@ -31,11 +25,6 @@
 #define _EXIT_REQ(x)    pthread_mutex_unlock(&x->mutex);
 
 httpsMemoryInterface mem = { malloc, calloc, realloc, free };
-
-typedef struct _headers {
-    char *str[MAX_HEADERS*2];
-    int last;
-} headers;
 
 typedef struct _httpsReq {
     void *request;
@@ -356,7 +345,7 @@ void httpsUpdate() {
                     r->returnCode = rc;
                 }
                 if (r->headerDone) {
-                    // might be valid, probe headers for content type and length
+                    // might be valid, probe httpsHeaders for content type and length
                     char *hval = (char*)naettGetHeader((naettRes*)r->res, "Content-Length");
                     if (hval != NULL) r->contentTotalBytes = atoi(hval);
                     r->contentMimeType = (char*)naettGetHeader((naettRes*)r->res, "Content-Type");
@@ -381,13 +370,13 @@ unsigned int httpsRequestCount() {
     return ret;
 }
 
-void* _makeRequest(httpsReq* r, const char *method, void* _headers, unsigned int bodyBytes, const char* body) {
-    if (_headers == NULL) {
+void* _makeRequest(httpsReq* r, const char *method, void* _httpsHeaders, unsigned int bodyBytes, const char* body) {
+    if (_httpsHeaders == NULL) {
         return (void*)naettRequest(r->URL, naettMethod(method), naettHeader("accept", "*/*"), naettBodyWriter(_bodyWriter, r));
     } else {
-        headers *h = (headers*)_headers;
+        httpsHeaders *h = (httpsHeaders*)_httpsHeaders;
         naettOption* bopt = NULL;
-        int l = h->last + 2;
+        int l = h->count + 2;
         int x = 0;
         if (body != NULL)
         {
@@ -399,25 +388,25 @@ void* _makeRequest(httpsReq* r, const char *method, void* _headers, unsigned int
         opts[x++] = naettMethod(method);
         opts[x++] = naettHeader("accept", "*/*");
         if (bopt != NULL) opts[x++] = bopt;
-        for (int i = 0; i < h->last; i++)
+        for (int i = 0; i < h->count; i++)
             opts[x++] = naettHeader(h->str[i*2], h->str[i*2+1]);
         return (void*)naettRequestWithOptions(r->URL, l, (const naettOption**)opts);
     }
 }
 
-void* httpsGet(const char *URL, int flags,  void *headers) {
+void* httpsGet(const char *URL, int flags,  void *httpsHeaders) {
     httpsReq* r;
     if ((con.bufferSize == 0) || (URL == NULL) || (strlen(URL) == 0)) return NULL;
     r = _newHttpsReq(flags);
     if (r == NULL) return NULL;
     r->URL = memStrdup(URL);
-    r->request = _makeRequest(r, "GET", headers, 0, NULL);
+    r->request = _makeRequest(r, "GET", httpsHeaders, 0, NULL);
     r->res = (void*)naettMake((naettReq*)r->request);
     r->complete = r->finished = false;
     return (void*)r;
 }
 
-void* httpsPost(const char *URL, int flags,  const char *body, unsigned int bodyBytes, void *headers) {
+void* httpsPost(const char *URL, int flags,  const char *body, unsigned int bodyBytes, void *httpsHeaders) {
     httpsReq* r;
     if ((con.bufferSize == 0) || (URL == NULL) || (strlen(URL) == 0)) return NULL;
     r = _newHttpsReq(flags);
@@ -433,13 +422,13 @@ void* httpsPost(const char *URL, int flags,  const char *body, unsigned int body
         r->body = malloc(bodyBytes);
         memcpy(r->body, body, bodyBytes);
     }
-    r->request = _makeRequest(r, "POST", headers, bodyBytes, body);
+    r->request = _makeRequest(r, "POST", httpsHeaders, bodyBytes, body);
     r->res = (void*)naettMake((naettReq*)r->request);
     r->complete = r->finished = false;
     return (void*)r;
 }
 
-void* httpsPostLinked(const char *URL, int flags,  const char *body, unsigned int bodyBytes, void *headers) {
+void* httpsPostLinked(const char *URL, int flags,  const char *body, unsigned int bodyBytes, void *httpsHeaders) {
     httpsReq* r;
     if ((con.bufferSize == 0) || (URL == NULL) || (strlen(URL) == 0)) return NULL;
     r = _newHttpsReq(flags);
@@ -454,19 +443,19 @@ void* httpsPostLinked(const char *URL, int flags,  const char *body, unsigned in
         r->bodyTotalBytes = bodyBytes;
         r->body = (char*)body;
     }
-    r->request = _makeRequest(r, "POST", headers, bodyBytes, body);
+    r->request = _makeRequest(r, "POST", httpsHeaders, bodyBytes, body);
     r->res = (void*)naettMake((naettReq*)r->request);
     r->complete = r->finished = false;
     return (void*)r;
 }
 
-void* httpsHead(const char *URL, int flags,  void *headers) {
+void* httpsHead(const char *URL, int flags,  void *httpsHeaders) {
     httpsReq* r;
     if ((con.bufferSize == 0) || (URL == NULL) || (strlen(URL) == 0)) return NULL;
     r = _newHttpsReq(flags);
     if (r == NULL) return NULL;
     r->URL = memStrdup(URL);
-    r->request = _makeRequest(r, "HEAD", headers, 0, NULL);
+    r->request = _makeRequest(r, "HEAD", httpsHeaders, 0, NULL);
     r->res = (void*)naettMake((naettReq*)r->request);
     r->complete = r->finished = false;
     return (void*)r;    
@@ -506,7 +495,7 @@ int _HeaderLister(const char* name, const char* value, void* userData) {
     return r->lister(name, value, userData);
 }
 
-void httpsListHeaders(void *p, httpsHeaderLister lister) {
+void httpsListhttpsHeaders(void *p, httpsHeaderLister lister) {
     httpsReq *r = (httpsReq*)p;
     _ENTER_REQ(r)
     r->lister = lister;
@@ -530,13 +519,12 @@ void httpsFinished(void *p) {
     _EXIT_REQ(r)
 }
 
-void* httpsNewHeaders() {
-    headers *h = calloc(1,sizeof(headers));
+void* httpsNewhttpsHeaders() {
+    httpsHeaders *h = calloc(1,sizeof(httpsHeaders));
     return (void*)h;
 }
 
-void httpsSetHeader(void *p, const char *name, const char *val) {
-    headers *h = (headers*)p;
+void httpsSetHeader(httpsHeaders *h, const char *name, const char *val) {
     int i;
     for (i = 0; i < MAX_HEADERS; i++) {
         if (!strcmp(name,h->str[i*2])) {
@@ -544,18 +532,17 @@ void httpsSetHeader(void *p, const char *name, const char *val) {
             h->str[i*2+1] = memStrdup(val);
         }
     }
-    if ((i == MAX_HEADERS) && (h->last != MAX_HEADERS)) {
-        i = h->last++;
+    if ((i == MAX_HEADERS) && (h->count != MAX_HEADERS)) {
+        i = h->count++;
         h->str[i*2] = memStrdup(name);
         h->str[i*2+1] = memStrdup(val);
     }
 }
 
-void httpsDelHeaders(void *p) {
-    headers *h = (headers*)p;
-    for (int i = 0; i < h->last*2; i++)
+void httpsDelhttpsHeaders(httpsHeaders *h) {
+    for (int i = 0; i < h->count*2; i++)
         mem.free(h->str[i]);
-    mem.free((headers*)h);
+    mem.free((httpsHeaders*)h);
 }
 
 unsigned int httpsGetBodyLength(void *p) {
@@ -590,6 +577,23 @@ void httpsRelease(void *p) {
     _EXIT_REQ(r)
 }
 
+void httpsGetInfo(httpsSystemInfo *info) {
+    memset(info, 0, sizeof(httpsSystemInfo));
+    _ENTER_
+    for (int i = 0; i < MAX_REQUEST; i++) {
+        httpsReq *r = con.requestTable[i];
+        if (r != NULL) {
+            info->numRequests++;
+            if (!r->complete) info->activeRequests++;
+        }
+    }
+    info->maxRequests = MAX_REQUEST;
+    info->bufferBytes = con.bufferBytes;
+    __EXIT_
+}
+
+bool libhttpsLove = false;
+
 #ifdef _WIN32
 
 void _stringSep(char* str, char** k, char** v)
@@ -616,21 +620,21 @@ void _stringSep(char* str, char** k, char** v)
 
 #endif
 
-headers *_easyCreateHeaders(const char* *_headers, int header_count, bool compact)
+httpsHeaders *_easyCreateHeaders(const char* *_httpsHeaders, int header_count, bool compact)
 {
-    headers *h = calloc(1,sizeof(_headers));
+    httpsHeaders *h = calloc(1,sizeof(_httpsHeaders));
     if (compact) {
         for (int i = 0; i < header_count; i++)
         {
             char *k, *v;
-            char *tst = memStrdup(_headers[i]);
+            char *tst = memStrdup(_httpsHeaders[i]);
             _stringSep(tst, &k, &v);
             httpsSetHeader(h, k, v);
         }
     } else {
         for (int i = 0; i < header_count; i++)
         {
-            httpsSetHeader(h, _headers[i*2], _headers[i*2+1]);
+            httpsSetHeader(h, _httpsHeaders[i*2], _httpsHeaders[i*2+1]);
         }
     }
     return h;
@@ -671,20 +675,26 @@ typedef struct _easyMetric {
 typedef struct _easyThreadStack {
     int version;
     int msgLimit;
-    int msgCount;
     int slotLimit;
-    int slotCount;
     easyMessage *msg;
     easyMessage *slot;
     pthread_mutex_t msgLock;
     pthread_mutex_t slotLock;
 } easyThreadStack;
 
+typedef struct _easyDataBlock {
+    httpsHeaders *headers;
+    int bodyBytes;
+    char *body;
+} easyDataBlock;
+
+pthread_t _thread;
 easyThreadStack *_threadStack = NULL;
 easyMetric _metricTable[MAX_REQUEST];
 unsigned int _easyOptions = 0;
 double _easyDelay = 0.0;
 
+#define EASY_THREADED       ((_threadStack != NULL) && (_threadStack->version == HTTPS_VERSION_NUM))
 #define EASY_OPT_FLAGS      1
 #define EASY_OPT_DELAY      2
 
@@ -701,8 +711,12 @@ double _easyDelay = 0.0;
 #define EASY_METRIC_REMAINING   7
 #define EASY_METRIC_RUNTIME     8
 
-void _easyThreadedCallback(int handle, const char* url, const char* msg, int code, unsigned int sz, void* data) {
-    // TODO
+xthread_ret easyWorkerThread(void *p) {
+    bool done = false;
+    while (!done) {
+        usleep(5000);
+    }
+    return (xthread_ret)0;
 }
 
 void easySetup(easyCallback cb, unsigned int bsize)
@@ -711,13 +725,13 @@ void easySetup(easyCallback cb, unsigned int bsize)
     _theEasyCallback = cb;
 }
 
-void easySetupThreaded(unsigned int msgQueDepth, unsigned int slotCount)
+void easySetupThreaded(easyCallback cb, unsigned int msgQueDepth, unsigned int slotCount)
 {
     if (msgQueDepth == 0) msgQueDepth = 200;
     if (slotCount == 0) slotCount = 50;
 
     httpsInit(NULL, 0);
-    _theEasyCallback = _easyThreadedCallback;
+    _theEasyCallback = cb;
 
     _threadStack = mem.calloc(1, sizeof(easyThreadStack));
     easyThreadStack *ps = _threadStack;
@@ -729,12 +743,22 @@ void easySetupThreaded(unsigned int msgQueDepth, unsigned int slotCount)
     if (ps->slot == NULL) return;
     pthread_mutex_init(&ps->msgLock, NULL);
     pthread_mutex_init(&ps->slotLock, NULL);
-    ps->version = 0x0100;
+    // make all the messages and slots invalid
+    pthread_mutex_lock(&ps->msgLock);
+    for (int i = 0; i < ps->msgLimit; i++)
+        ps->msg[i].handle = -1;
+    pthread_mutex_unlock(&ps->msgLock);
+    pthread_mutex_lock(&ps->slotLock);
+    for (int i = 0; i < ps->slotLimit; i++)
+        ps->slot[i].handle = -1;
+    pthread_mutex_unlock(&ps->slotLock);
+    ps->version = HTTPS_VERSION_NUM;
+    xthread_create(&_thread, easyWorkerThread, NULL);
 }
 
-void easyListHeaders(int h, httpsHeaderLister lister)
+void easyListhttpsHeaders(int h, httpsHeaderLister lister)
 {
-    httpsListHeaders(con.requestTable[h], lister);
+    httpsListhttpsHeaders(con.requestTable[h], lister);
 }
 
 void easyOptionUI(unsigned int opt, unsigned int val) {
@@ -819,7 +843,7 @@ void easyUpdate()
     int mcnt = 0;
     double secs;
     // are we threaded? if so, why are we calling this? bug out
-    if ((_threadStack != NULL) && (_threadStack->version == 0x0100)) return;
+    if EASY_THREADED return;
     // or... proceed and handle the update
     httpsUpdate();
     pthread_mutex_lock(&con.mainLock);
@@ -836,8 +860,8 @@ void easyUpdate()
                 d->returnCode = r->returnCode;
             }
             if (r->headerDone != d->headerDone) {
-                // we have all the headers!
-                _theEasyCallback(i, r->URL, "HEADERS", r->returnCode, 0, (void*)_easyGetHeader);
+                // we have all the httpsHeaders!
+                _theEasyCallback(i, r->URL, "httpsHeaders", r->returnCode, 0, (void*)_easyGetHeader);
                 d->headerDone = r->headerDone;
             }
             if (r->contentTotalBytes != d->contentTotalBytes) {
@@ -898,23 +922,125 @@ void easyUpdate()
     if (_easyDelay > 0.0) usleep((useconds_t)(_easyDelay * 1000000));
 }
 
-int easyGet(const char *URL, int flags, const char* *_headers, int header_count, bool header_compact)
-{
-    headers *h;
+static inline int easyFreeSlot() {
+    int ret = -1, i;
+    pthread_mutex_lock(&_threadStack->slotLock);
+    for (i = 0; i < _threadStack->slotLimit; i++)
+        if (_threadStack->slot[i].handle == -1) {
+            _threadStack->slot[i].handle = HTTPS_OPEN_HANDLE;
+            break;
+        }
+    pthread_mutex_unlock(&_threadStack->slotLock);
+    if (i < _threadStack->slotLimit) ret = i;
+    return ret;
+}
+
+static inline easyDataBlock* easyMakeDataBlock(const char *body, unsigned int bodyBytes, const char* *_httpsHeaders, int header_count, bool header_compact) {
+    easyDataBlock *d = mem.calloc(1, sizeof(easyDataBlock));
+    if (d == NULL) return NULL;
+    // copy the body data if needed
+    if (body != NULL && bodyBytes > 0) {
+        d->bodyBytes = bodyBytes;
+        d->body = mem.malloc(bodyBytes);
+        if (d->body == NULL) {
+            mem.free(d);
+            return NULL;
+        }
+        memcpy(d->body, body, bodyBytes);
+    }
+    // copy the header data if needed
+    if (_httpsHeaders != NULL && header_count > 0) {
+        d->headers = mem.malloc(sizeof(httpsHeaders));
+        d->headers->count = header_count;
+        if (header_compact) {
+            for (int i = 0; i < header_count; i++) {
+                char *k, *v;
+                char *tst = memStrdup(_httpsHeaders[i]);
+                _stringSep(tst, &k, &v);
+                d->headers->str[i*2] = memStrdup(k);
+                d->headers->str[i*2+1] = memStrdup(v);
+                mem.free(tst);
+            }
+        } else {
+            for (int i = 0; i < header_count; i++) {
+                d->headers->str[i*2] = memStrdup(_httpsHeaders[i*2]);
+                d->headers->str[i*2+1] = memStrdup(_httpsHeaders[i*2+1]);
+            }
+        }
+    }
+    return d;
+}
+
+static inline easyDataBlock* easyMakeDataBlockPass(const char *body, unsigned int bodyBytes, httpsHeaders *h) {
+    easyDataBlock *d = mem.calloc(1, sizeof(easyDataBlock));
+    if (d == NULL) return NULL;
+    // copy the body data if needed
+    if (body != NULL && bodyBytes > 0) {
+        d->bodyBytes = bodyBytes;
+        d->body = mem.malloc(bodyBytes);
+        if (d->body == NULL) {
+            mem.free(d);
+            return NULL;
+        }
+        memcpy(d->body, body, bodyBytes);
+    }
+    // pass through the header data if needed
+    if (h != NULL) d->headers = h;
+    return d;
+}
+
+static inline int easyThreadedSlot(const char *mode, const char *URL, int flags, const char *body, unsigned int bodyBytes, 
+                                        const char* *_httpsHeaders, int header_count, bool header_compact) {
+    int slot = easyFreeSlot();
+    if (slot < 0) return slot;
+    easyMessage *m = &_threadStack->slot[slot];
+    m->version = 0;
+    m->slot = slot;
+    m->url = memStrdup(URL);
+    strcpy(m->message, mode);
+    m->code = 0;
+    m->sz = 0;
+    if (((header_count > 0) && (_httpsHeaders != NULL)) || ((body != NULL) && (bodyBytes > 0))) 
+        m->data = easyMakeDataBlock(body, bodyBytes, _httpsHeaders, header_count, header_compact);
+    else
+        m->data = NULL;
+    m->version = HTTPS_VERSION_NUM;
+    return slot;
+}
+
+static inline int easyThreadedSlotPass(const char *mode, const char *URL, int flags, const char *body, unsigned int bodyBytes, 
+                                        httpsHeaders *h) {
+    int slot = easyFreeSlot();
+    if (slot < 0) return slot;
+    easyMessage *m = &_threadStack->slot[slot];
+    m->version = 0;
+    m->slot = slot;
+    m->url = memStrdup(URL);
+    strcpy(m->message, mode);
+    m->code = 0;
+    m->sz = 0;
+    if ((h != NULL) || ((body != NULL) && (bodyBytes > 0))) 
+        m->data = easyMakeDataBlockPass(body, bodyBytes, h);
+    else
+        m->data = NULL;
+    m->version = HTTPS_VERSION_NUM;
+    return slot;
+}
+
+int easyGet(const char *URL, int flags, const char* *_httpsHeaders, int header_count, bool header_compact) {
+    httpsHeaders *h;
     httpsReq *r;
 
     // are we threaded? if so, we just populate a message slot and leave
-    if ((_threadStack != NULL) && (_threadStack->version == 0x0100)) {
-        int slot = -1;
-        // TODO
-        return slot;
+    if EASY_THREADED {
+        return easyThreadedSlot("GET", URL, flags, NULL, 0, _httpsHeaders, header_count, header_compact);
     }
 
-    if ((header_count > 0) && (_headers != NULL))
+    if ((header_count > 0) && (_httpsHeaders != NULL))
     {
-        h = _easyCreateHeaders(_headers, header_count, header_compact);
+        h = _easyCreateHeaders(_httpsHeaders, header_count, header_compact);
         r = httpsGet(URL, flags, h);
-        httpsDelHeaders(h);
+        httpsDelhttpsHeaders(h);
     } else
         r = httpsGet(URL, flags, NULL);
     r->userData = mem.calloc(1, sizeof(easyData));
@@ -922,15 +1048,20 @@ int easyGet(const char *URL, int flags, const char* *_headers, int header_count,
     return r->index;
 }
 
-int easyPost(const char *URL, int flags, const char *body, unsigned int bodyBytes, const char* *_headers, int header_count, bool header_compact)
-{
-    headers *h;
+int easyPost(const char *URL, int flags, const char *body, unsigned int bodyBytes, const char* *_httpsHeaders, int header_count, bool header_compact) {
+    httpsHeaders *h;
     httpsReq *r;
-    if ((header_count > 0) && (_headers != NULL))
+
+    // are we threaded? if so, we just populate a message slot and leave
+    if EASY_THREADED {
+        return easyThreadedSlot("POST", URL, flags, body, bodyBytes, _httpsHeaders, header_count, header_compact);
+    }
+
+    if ((header_count > 0) && (_httpsHeaders != NULL))
     {
-        h = _easyCreateHeaders(_headers, header_count, header_compact);
+        h = _easyCreateHeaders(_httpsHeaders, header_count, header_compact);
         r = httpsPost(URL, flags, body, bodyBytes, h);
-        httpsDelHeaders(h);
+        httpsDelhttpsHeaders(h);
     } else
         r = httpsPost(URL, flags, body, bodyBytes, NULL);
     r->userData = mem.calloc(1, sizeof(easyData));
@@ -938,17 +1069,62 @@ int easyPost(const char *URL, int flags, const char *body, unsigned int bodyByte
     return r->index;
 }
 
-int easyHead(const char *URL, int flags, const char* *_headers, int header_count, bool header_compact)
-{
-    headers *h;
+int easyHead(const char *URL, int flags, const char* *_httpsHeaders, int header_count, bool header_compact) {
+    httpsHeaders *h;
     httpsReq *r;
-    if ((header_count > 0) && (_headers != NULL))
+
+    if EASY_THREADED {
+        return easyThreadedSlot("HEAD", URL, flags, NULL, 0, _httpsHeaders, header_count, header_compact);
+    }
+
+    if ((header_count > 0) && (_httpsHeaders != NULL))
     {
-        h = _easyCreateHeaders(_headers, header_count, header_compact);
+        h = _easyCreateHeaders(_httpsHeaders, header_count, header_compact);
         r = httpsHead(URL, flags, h);
-        httpsDelHeaders(h);
+        httpsDelhttpsHeaders(h);
     } else
         r = httpsHead(URL, flags, NULL);
+    r->userData = mem.calloc(1, sizeof(easyData));
+    _theEasyCallback(r->index, r->URL, "START", r->returnCode, 0, NULL);
+    return r->index;
+}
+
+int easyGetPass(const char *URL, int flags, httpsHeaders *h) {
+    httpsReq *r;
+
+    // are we threaded? if so, we just populate a message slot and leave
+    if EASY_THREADED {
+        return easyThreadedSlotPass("GET", URL, flags, NULL, 0, h);
+    }
+
+    r = httpsGet(URL, flags, h);
+    r->userData = mem.calloc(1, sizeof(easyData));
+    _theEasyCallback(r->index, r->URL, "START", r->returnCode, 0, NULL);
+    return r->index;
+}
+
+int easyPostPass(const char *URL, int flags, const char *body, unsigned int bodyBytes, httpsHeaders *h) {
+    httpsReq *r;
+
+    // are we threaded? if so, we just populate a message slot and leave
+    if EASY_THREADED {
+        return easyThreadedSlotPass("POST", URL, flags, body, bodyBytes, h);
+    }
+
+    r = httpsPost(URL, flags, body, bodyBytes, h);
+    r->userData = mem.calloc(1, sizeof(easyData));
+    _theEasyCallback(r->index, r->URL, "START", r->returnCode, 0, NULL);
+    return r->index;
+}
+
+int easyHeadPass(const char *URL, int flags, httpsHeaders *h) {
+    httpsReq *r;
+
+    if EASY_THREADED {
+        return easyThreadedSlotPass("HEAD", URL, flags, NULL, 0, h);
+    }
+
+    r = httpsHead(URL, flags, h);    
     r->userData = mem.calloc(1, sizeof(easyData));
     _theEasyCallback(r->index, r->URL, "START", r->returnCode, 0, NULL);
     return r->index;
@@ -964,7 +1140,7 @@ int _luaIdLocation = 51;
 
 #define EASY_CB_START       1
 #define EASY_CB_UPDATE      2
-#define EASY_CB_HEADERS     3
+#define EASY_CB_httpsHeaders     3
 #define EASY_CB_LENGTH      4
 #define EASY_CB_MIME        5
 #define EASY_CB_READ        6
@@ -1002,7 +1178,7 @@ void lua_Callback(int handle, const char* url, const char* msg, int code, unsign
         // find the callback in the 
         if (!strcmp(msg,"START")) { lua_pushliteral(lState,"start"); cbm = EASY_CB_START; }
          else if (!strcmp(msg,"UPDATE")) { lua_pushliteral(lState,"update"); cbm = EASY_CB_UPDATE; }
-         else if (!strcmp(msg,"HEADERS")) { lua_pushliteral(lState,"headers"); cbm = EASY_CB_HEADERS; }
+         else if (!strcmp(msg,"httpsHeaders")) { lua_pushliteral(lState,"httpsHeaders"); cbm = EASY_CB_httpsHeaders; }
          else if (!strcmp(msg,"LENGTH")) { lua_pushliteral(lState,"length"); cbm = EASY_CB_LENGTH; }
          else if (!strcmp(msg,"MIME")) { lua_pushliteral(lState,"mime"); cbm = EASY_CB_MIME; }
          else if (!strcmp(msg,"READ")) { lua_pushliteral(lState,"read"); cbm = EASY_CB_READ; }
@@ -1018,7 +1194,7 @@ void lua_Callback(int handle, const char* url, const char* msg, int code, unsign
             lua_pushinteger(lState, sz);
             if (data) {
                 if (cbm == EASY_CB_MIME) lua_pushstring(lState, (char*)data);
-                if (cbm == EASY_CB_HEADERS) {
+                if (cbm == EASY_CB_httpsHeaders) {
                     lua_pushinteger(lState, handle);
                     lua_pushlightuserdata(lState, data);
                     lua_pushcclosure(lState, lua_ReadHeader, 2);
@@ -1033,6 +1209,57 @@ void lua_Callback(int handle, const char* url, const char* msg, int code, unsign
     lua_settop(lState, t);
 }
 
+/*
+    function love.handlers.https(what, handle, url, msg, code, sz data)
+    end
+
+    what: the event that occured on this handle ->
+        'start' - the request was started
+        'update' - status change, likely a return code was received
+        'headers' - all the request headers have been received
+        'length' - content length (in bytes) was determined
+        'mime' - content mime type was determined
+        'read' - a single read event finished (might need multiple to complete)
+        'complete' - the request has been completed (ok or error)
+*/
+void luaLove_Callback(int handle, const char* url, const char* msg, int code, unsigned int sz, void* data)
+{
+    int t = lua_gettop(lState);
+    int cbm = 0;
+    lua_getfield(lState, LUA_GLOBALSINDEX, "love");
+    lua_getfield(lState, -1, "handlers");
+    lua_getfield(lState, -1, "https");
+    if (lua_isfunction(lState,-1)) {
+        // find the callback in the 
+        if (!strcmp(msg,"START")) { lua_pushliteral(lState,"start"); cbm = EASY_CB_START; }
+         else if (!strcmp(msg,"UPDATE")) { lua_pushliteral(lState,"update"); cbm = EASY_CB_UPDATE; }
+         else if (!strcmp(msg,"HEADERS")) { lua_pushliteral(lState,"headers"); cbm = EASY_CB_httpsHeaders; }
+         else if (!strcmp(msg,"LENGTH")) { lua_pushliteral(lState,"length"); cbm = EASY_CB_LENGTH; }
+         else if (!strcmp(msg,"MIME")) { lua_pushliteral(lState,"mime"); cbm = EASY_CB_MIME; }
+         else if (!strcmp(msg,"READ")) { lua_pushliteral(lState,"read"); cbm = EASY_CB_READ; }
+         else if (!strcmp(msg,"COMPLETE")) { lua_pushliteral(lState,"complete"); cbm = EASY_CB_COMPLETE; }
+         else lua_pushliteral(lState,"nope");
+        lua_pushinteger(lState, handle);
+        lua_pushstring(lState, url);
+        lua_pushstring(lState, msg);
+        lua_pushinteger(lState, code);
+        lua_pushinteger(lState, sz);
+        if (data) {
+            if (cbm == EASY_CB_MIME) lua_pushstring(lState, (char*)data);
+            if (cbm == EASY_CB_httpsHeaders) {
+                lua_pushinteger(lState, handle);
+                lua_pushlightuserdata(lState, data);
+                lua_pushcclosure(lState, lua_ReadHeader, 2);
+            }
+            if (cbm == EASY_CB_COMPLETE) {
+                lua_pushlightuserdata(lState, data);
+            }
+        } else lua_pushnil(lState);
+        lua_call(lState, 7, 0);
+    }
+    lua_settop(lState, t);
+}
+
 /* 
     https.update()
 
@@ -1041,6 +1268,12 @@ void lua_Callback(int handle, const char* url, const char* msg, int code, unsign
     will delay that many seconds before returning
 */
 int lua_Update(lua_State* L) {
+    // are we threaded? poll the messages
+    if EASY_THREADED {
+        // TODO
+        return 0;
+    }
+    // pass the call down
     lua_getregtable(L);
     lua_assert_init(L);
     easyUpdate();
@@ -1048,15 +1281,15 @@ int lua_Update(lua_State* L) {
 }
 
 /* 
-    https.get(url, callback, headers)
+    https.get(url, callback, httpsHeaders)
 
     url is a string with the url to be requested using http get.
 
     callback is a table object which gets callbacks from this request, as so:
         callback:name(vars)
 
-    headers is an optional table of headers to pass to this request
-        the string:string keys/values of the table only are sent as http headers
+    httpsHeaders is an optional table of httpsHeaders to pass to this request
+        the string:string keys/values of the table only are sent as http httpsHeaders
 */
 int lua_Get(lua_State* L) {
     const char *head[MAX_HEADERS*2];
@@ -1096,7 +1329,7 @@ int lua_Get(lua_State* L) {
 }
 
 /* 
-    https.get(url, body, callback, headers)
+    https.get(url, body, callback, httpsHeaders)
 
     url is a string with the url to be requested using http get.
 
@@ -1105,8 +1338,8 @@ int lua_Get(lua_State* L) {
     callback is a table object which gets callbacks from this request, as so:
         callback:name(vars)
 
-    headers is an optional table of headers to pass to this request
-        the string:string keys/values of the table only are sent as http headers
+    httpsHeaders is an optional table of httpsHeaders to pass to this request
+        the string:string keys/values of the table only are sent as http httpsHeaders
 */
 int lua_Post(lua_State* L) {
     const char *head[MAX_HEADERS*2];
@@ -1148,15 +1381,15 @@ int lua_Post(lua_State* L) {
 }
 
 /* 
-    https.head(url, callback, headers)
+    https.head(url, callback, httpsHeaders)
 
     url is a string with the url to be requested using http head.
 
     callback is a table object which gets callbacks from this request, as so:
         callback:name(vars)
 
-    headers is an optional table of headers to pass to this request
-        the string:string keys/values of the table only are sent as http headers
+    httpsHeaders is an optional table of httpsHeaders to pass to this request
+        the string:string keys/values of the table only are sent as http httpsHeaders
 */
 int lua_Head(lua_State* L) {
     const char *head[MAX_HEADERS*2];
@@ -1196,17 +1429,33 @@ int lua_Head(lua_State* L) {
 }
 
 /* 
-    https.init(nil or bytes)
-
     called to initialize the system, must be done for any other calls into https
 
-    if passed a number, that is the amount of buffer bytes used by requests,
-    defaults to 16384 for 16kb
+    https.init(false, nil or bytes)
+  
+        false makes an unthreaded system.
+
+        if passed a number for argument two, that is the amount of buffer bytes used by requests,
+        defaults to 16384 for 16kb
+
+    https.init(true, msg, slot)
+
+        true creates a threaded system.
+
+        msg is the msq que depth
+
+        slot is the slot que depth
 */
 int lua_Init(lua_State* L) {
-    if (lua_isnumber (L, 1)) {
-        easySetup(lua_Callback, lua_tointeger(L, 1));
-    } else easySetup(lua_Callback, 0);
+    int arg2 = 0;
+    int arg3 = 0;
+    if (lua_isnumber (L, 2)) arg2 = lua_tointeger(L, 2);
+    if (lua_isnumber (L, 3)) arg3 = lua_tointeger(L, 3);
+    if (lua_toboolean(L, 1) > 0) {
+        easySetupThreaded(lua_Callback, arg2, arg3);
+    } else {
+        easySetup(lua_Callback, arg2);
+    }
     lua_getregtable(L);
     lua_pushinteger(L, 2422422);
     lua_rawseti(L, -2, 1421421);
@@ -1319,13 +1568,13 @@ int lua_HeaderLister(const char* name, const char* value, void* r)
 
     handle integer of the request
 
-    returns a table of read headers for the request
+    returns a table of read httpsHeaders for the request
 */
 int lua_List(lua_State* L) {
     int h = luaL_checkinteger(L, 1);
     if ((h < 0) || (h >= MAX_REQUEST)) luaL_error(L, "https.list() called with out of range value %d", h);
     lua_newtable(L);
-    httpsListHeaders(con.requestTable[h], lua_HeaderLister);
+    httpsListhttpsHeaders(con.requestTable[h], lua_HeaderLister);
     return 1;
 }
 
@@ -1370,9 +1619,25 @@ int lua_Release(lua_State* L) {
     return 0;
 }
 
+/* 
+    https.memio(handle)
+
+    handle integer of the request
+
+    returns a memio interface into the body of the request
+*/
+int lua_Memio(lua_State* L) {
+    int h = luaL_checkinteger(L, 1);
+    if ((h < 0) || (h >= MAX_REQUEST)) luaL_error(L, "https.memio() called with out of range value %d", h);
+    httpsReq *r = con.requestTable[h];
+    if (!r->complete)  luaL_error(L, "https.memio() called on an incomplete request");
+    lua_pushIO(L, r->body, r->bodyTotalBytes, 0);
+    return 1;
+}
+
 luaL_Reg lfunc[] = {
     { "init", lua_Init },
-    { "shutdown", lua_Init },
+    { "shutdown", lua_Shutdown },
     { "options", lua_Options },
     { "metrics", lua_Metrics },
     { "release", lua_Release },
@@ -1383,6 +1648,7 @@ luaL_Reg lfunc[] = {
     { "post", lua_Post  },
     { "head", lua_Head  },
     { "body", lua_Body  },
+    { "memio", lua_Memio  },
     { NULL, NULL },
 };
 
@@ -1392,6 +1658,23 @@ int luaopen_libhttps(lua_State* L) {
     lua_newtable (L);
     lua_rawset (L, LUA_REGISTRYINDEX);
     luaL_register(L, "https", lfunc);
+    // detect love and set the flag for integration
+    lua_getfield(L, LUA_GLOBALSINDEX, "love");
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "getVersion");
+        if (lua_isfunction(L, -1)) {
+            libhttpsLove = true;
+            easySetupThreaded(luaLove_Callback, 0, 0);
+            lua_getregtable(L);
+            lua_pushinteger(L, 2422422);
+            lua_rawseti(L, -2, 1421421);
+            lua_pop(L, 1);
+        }
+         else libhttpsLove = false;
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+
     return 1;
 }
 
