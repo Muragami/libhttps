@@ -659,6 +659,8 @@ typedef struct _easyData {
     unsigned int readTotalBytes;
     unsigned int contentTotalBytes;
     char *contentMimeType;
+    void *user;
+    int flushMode;
 } easyData;
 
 typedef struct _easyMetric {
@@ -686,6 +688,7 @@ typedef struct _easyDataBlock {
     httpsHeaders *headers;
     int bodyBytes;
     char *body;
+    void *user;
 } easyDataBlock;
 
 pthread_t _thread;
@@ -711,6 +714,15 @@ double _easyDelay = 0.0;
 #define EASY_METRIC_REMAINING   7
 #define EASY_METRIC_RUNTIME     8
 
+
+void easyFlush(int index, const char* URL, void *user, memBuffer *p) {
+    easyData *d = (easyData*)user;
+    if (d->flushMode == 0) {
+        FILE *fp = (FILE*)d->user;
+        fwrite(p->data, 1, p->end, fp);
+    }
+}
+
 xthread_ret easyWorkerThread(void *p) {
     bool done = false;
     while (!done) {
@@ -722,6 +734,7 @@ xthread_ret easyWorkerThread(void *p) {
 void easySetup(easyCallback cb, unsigned int bsize)
 {
     httpsInit(NULL, bsize);
+    httpsSetFlushRoutine(easyFlush);
     _theEasyCallback = cb;
 }
 
@@ -731,6 +744,7 @@ void easySetupThreaded(easyCallback cb, unsigned int msgQueDepth, unsigned int s
     if (slotCount == 0) slotCount = 50;
 
     httpsInit(NULL, 0);
+    httpsSetFlushRoutine(easyFlush);
     _theEasyCallback = cb;
 
     _threadStack = mem.calloc(1, sizeof(easyThreadStack));
@@ -1048,6 +1062,32 @@ int easyGet(const char *URL, int flags, const char* *_httpsHeaders, int header_c
     return r->index;
 }
 
+int easyGetFile(const char *URL, const char *ofname, const char* *_httpsHeaders, int header_count, bool header_compact) {
+    httpsHeaders *h;
+    httpsReq *r;
+
+    // are we threaded? if so, we just populate a message slot and leave
+    if EASY_THREADED {
+        int slot = easyThreadedSlot("GET", URL, HTTPS_REUSE_BUFFER, NULL, 0, _httpsHeaders, header_count, header_compact);
+        _threadStack->slot[slot].flush = (void*)easyFlush;
+        _threadStack->slot[slot].user = (void*)fopen(ofname, "wb");
+        return slot;
+    }
+
+    if ((header_count > 0) && (_httpsHeaders != NULL))
+    {
+        h = _easyCreateHeaders(_httpsHeaders, header_count, header_compact);
+        r = httpsGet(URL, HTTPS_REUSE_BUFFER, h);
+        httpsDelhttpsHeaders(h);
+    } else
+        r = httpsGet(URL, HTTPS_REUSE_BUFFER, NULL);
+    easyData *d = mem.calloc(1, sizeof(easyData));
+    d->user = (void*)fopen(ofname, "wb");
+    r->userData = d;
+    _theEasyCallback(r->index, r->URL, "START", r->returnCode, 0, NULL);
+    return r->index;
+}
+
 int easyPost(const char *URL, int flags, const char *body, unsigned int bodyBytes, const char* *_httpsHeaders, int header_count, bool header_compact) {
     httpsHeaders *h;
     httpsReq *r;
@@ -1134,6 +1174,7 @@ void easyShutdown()
 {
     httpsCleanup();
 }
+
 
 lua_State* lState = NULL;
 int _luaIdLocation = 51;
@@ -1283,13 +1324,13 @@ int lua_Update(lua_State* L) {
 /* 
     https.get(url, callback, httpsHeaders)
 
-    url is a string with the url to be requested using http get.
+        url is a string with the url to be requested using http get.
 
-    callback is a table object which gets callbacks from this request, as so:
-        callback:name(vars)
+        callback is a table object which gets callbacks from this request, as so:
+            callback:name(vars)
 
-    httpsHeaders is an optional table of httpsHeaders to pass to this request
-        the string:string keys/values of the table only are sent as http httpsHeaders
+        httpsHeaders is an optional table of httpsHeaders to pass to this request
+            the string:string keys/values of the table only are sent as http httpsHeaders
 */
 int lua_Get(lua_State* L) {
     const char *head[MAX_HEADERS*2];
@@ -1328,8 +1369,60 @@ int lua_Get(lua_State* L) {
     return 1;
 }
 
+
 /* 
-    https.get(url, body, callback, httpsHeaders)
+    https.getFile(url, outfilename, callback, httpsHeaders)
+
+        url is a string with the url to be requested using http get.
+
+        outfilename is where the body of the request will be written.
+
+        callback is a table object which gets callbacks from this request, as so:
+            callback:name(vars)
+
+        httpsHeaders is an optional table of httpsHeaders to pass to this request
+            the string:string keys/values of the table only are sent as http httpsHeaders
+*/
+int lua_GetFile(lua_State* L) {
+    const char *head[MAX_HEADERS*2];
+    int i = 0;
+    int r = 0;
+    const char *url = luaL_checklstring(L, 1, NULL);
+    const char *ofname = luaL_checklstring(L, 2, NULL);
+    luaL_checktype(L, 3, LUA_TTABLE);
+    if (lua_istable(L, 4)) {
+        // scan the table for string pairs, ignoring everything else
+        lua_pushnil(L);
+        while ((lua_next(L, 3) != 0) && (i < MAX_HEADERS)) {
+            if (lua_isstring(L, -2) && lua_isstring(L, -1)) {
+                head[i*2] = lua_tolstring(L, -2, NULL);
+                head[i*2+1] = lua_tolstring(L, -1, NULL);
+                i++;
+            }
+            lua_pop(L, 1);
+        }
+        r = easyGetFile(url, ofname, head, i, false);
+    } else {
+        r = easyGetFile(url, ofname, NULL, 0, false);
+    }
+    lua_getregtable(L);
+    lua_assert_init(L);
+    lua_pushvalue(L, 2);
+    lua_rawseti(L, -2, r);
+    // see if the callback has a table called handle and if it does, add this handle to it
+    lua_getfield(L, 2, "handle");
+    if (lua_istable(L, -1)) {
+        lua_pushinteger(L, r);
+        lua_pushvalue(L, 1);
+        lua_settable(L, -3);
+    }
+    lua_settop(L, 3);
+    lua_pushinteger(L, r);
+    return 1;
+}
+
+/* 
+    https.post(url, body, callback, httpsHeaders)
 
     url is a string with the url to be requested using http get.
 

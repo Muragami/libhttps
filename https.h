@@ -63,13 +63,15 @@ typedef int (*httpsHeaderLister)(const char* name, const char* value, void* r);
 // a flush routine to call when a read buffer is full
 typedef void (*httpsFlush)(int index, const char* URL, void *user, memBuffer *p);
 
-#define HTTPS_FIXED_BUFFER          0x10000000      // a fixed buffer for this request
-#define HTTPS_PERSISTENT_BUFFER     0x30000000      // use an established already existing buffer (always also fixed size)
-#define HTTPS_REUSE_BUFFER          0x40000000      // reuse a buffer, using a flush callback each time it's full
-#define HTTPS_DOUBLE_UNTIL          0x80000000      // double realloc() until we hit a set size and them just allocated that size over and over (2x, 3x, etc.)
-#define HTTPS_DOUBLE_FOREVER(x)     ((x & 0xF0000000) == 0)      
+#define HTTPS_FIXED_BUFFER          0x01000000      // a fixed buffer for this request
+#define HTTPS_PERSISTENT_BUFFER     0x03000000      // use an established already existing buffer (always also fixed size)
+#define HTTPS_REUSE_BUFFER          0x04000000      // reuse a buffer, using a flush callback each time it's full
+#define HTTPS_DOUBLE_UNTIL          0x08000000      // double realloc() until we hit a set size and them just allocated that size over and over (2x, 3x, etc.)
+#define HTTPS_DOUBLE_FOREVER(x)     ((x & 0xFF000000) == 0)      
                                                     // just double each time we realloc()
-#define HTTPS_BUFFER_KB(x)          (x & 0xFFFFFFF) // ~ 255GB is the largest fixed buffer we can support, allocated as 1 kb units
+#define HTTPS_SLOT_REQUEST          0x10000000      // a slot request
+#define HTTPS_SLOT(x)               (x & 0xFF)      // the slot value
+#define HTTPS_BUFFER_KB(x)          (x & 0xFFFFFF)  // ~ 16GB is the largest fixed buffer we can support, allocated as 1 kb units
 #define HTTPS_PERSIST_ID(x)         (x & 0xFFFF)    // 65536 possible persistant buffers
 #define HTTPS_OPEN_BUFFER           0xFFFFFFFF      // a buffer end point that is invalid
 #define HTTPS_OPEN_HANDLE           0xFFFFFFFF      // a buffer end point that is invalid
@@ -121,7 +123,8 @@ typedef struct _easyMessage {
     int code;
     unsigned int sz;
     void *data;
-    unsigned int config[4];
+    void *user;
+    void *flush;
 } easyMessage;
 
 void easySetup(easyCallback cb, unsigned int bsize);
